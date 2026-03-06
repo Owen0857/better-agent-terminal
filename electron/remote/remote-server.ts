@@ -1,5 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import { randomBytes } from 'crypto'
+import * as fs from 'fs'
+import * as path from 'path'
 import { invokeHandler } from './handler-registry'
 import { broadcastHub } from './broadcast-hub'
 import { PROXIED_EVENTS, type RemoteFrame } from './protocol'
@@ -16,6 +18,7 @@ export class RemoteServer {
   private clients: Map<WebSocket, AuthenticatedClient> = new Map()
   private broadcastListener: ((...args: unknown[]) => void) | null = null
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null
+  configDir: string = '' // Set by main.ts to app.getPath('userData')
 
   get port(): number | null {
     const addr = this.wss?.address()
@@ -34,10 +37,35 @@ export class RemoteServer {
     }))
   }
 
+  private loadPersistedToken(): string | null {
+    if (!this.configDir) return null
+    try {
+      const tokenPath = path.join(this.configDir, 'server-token.json')
+      const data = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'))
+      return data.token || null
+    } catch {
+      return null
+    }
+  }
+
+  private persistToken(token: string): void {
+    if (!this.configDir) return
+    try {
+      fs.writeFileSync(
+        path.join(this.configDir, 'server-token.json'),
+        JSON.stringify({ token }, null, 2)
+      )
+    } catch (e) {
+      console.warn('[RemoteServer] Failed to persist token:', e)
+    }
+  }
+
   start(port: number = 9876, token?: string): { port: number; token: string } {
     if (this.wss) throw new Error('Server already running')
 
-    this.token = token || randomBytes(16).toString('hex')
+    // Priority: explicit token > persisted token > new random token
+    this.token = token || this.loadPersistedToken() || randomBytes(16).toString('hex')
+    this.persistToken(this.token)
 
     this.wss = new WebSocketServer({ port })
 

@@ -198,6 +198,7 @@ const launchProfileId = profileArg ? profileArg.split('=')[1] || null : null
 
 app.whenReady().then(async () => {
   buildMenu()
+  remoteServer.configDir = app.getPath('userData')
   createWindow()
 
   // Listen for system resume from sleep/hibernate
