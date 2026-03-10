@@ -634,6 +634,19 @@ export class ClaudeAgentManager {
     } finally {
       if (session) {
         session.state.isStreaming = false
+        // Mark any tool calls still in 'running' state as error (e.g. subprocess crashed)
+        for (const msg of session.state.messages) {
+          if ('toolName' in msg && (msg as ClaudeToolCall).status === 'running') {
+            const toolMsg = msg as ClaudeToolCall
+            toolMsg.status = 'error'
+            toolMsg.result = toolMsg.result || 'Agent terminated unexpectedly'
+            this.send('claude:tool-result', sessionId, {
+              id: toolMsg.id,
+              status: 'error',
+              result: toolMsg.result,
+            })
+          }
+        }
         // Process queued messages
         const next = session.messageQueue.shift()
         if (next) {
@@ -810,7 +823,7 @@ export class ClaudeAgentManager {
     const os = await import('os')
     const readline = await import('readline')
 
-    const encoded = cwd.replace(/:/g, '-').replace(/[\\/]/g, '-')
+    const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-')
     const projectDir = pathModule.join(os.homedir(), '.claude', 'projects', encoded)
 
     const results: SessionSummary[] = []
@@ -888,7 +901,7 @@ export class ClaudeAgentManager {
     const os = await import('os')
     const readline = await import('readline')
 
-    const encoded = cwd.replace(/:/g, '-').replace(/[\\/]/g, '-')
+    const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-')
     const projectDir = pathModule.join(os.homedir(), '.claude', 'projects', encoded)
     const filePath = pathModule.join(projectDir, `${sdkSessionId}.jsonl`)
 
