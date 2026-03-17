@@ -2,6 +2,7 @@ import WebSocket from 'ws'
 import { randomBytes } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { PROXIED_EVENTS, type RemoteFrame } from './protocol'
+import { logger } from '../logger'
 
 interface PendingInvoke {
   resolve: (result: unknown) => void
@@ -88,11 +89,11 @@ export class RemoteClient {
             authResolved = true
             if (frame.error) {
               this._connected = false
-              console.error(`[RemoteClient] Auth failed: ${frame.error}`)
+              logger.error(`[RemoteClient] Auth failed: ${frame.error}`)
               resolve(false)
             } else {
               this._connected = true
-              console.log(`[RemoteClient] Connected to ${this.host}:${this.port}`)
+              logger.log(`[RemoteClient] Connected to ${this.host}:${this.port}`)
               resolve(true)
             }
           }
@@ -141,7 +142,7 @@ export class RemoteClient {
         }
 
         if (wasConnected) {
-          console.log('[RemoteClient] Disconnected')
+          logger.log('[RemoteClient] Disconnected')
         }
 
         // Auto-reconnect if we should
@@ -151,7 +152,7 @@ export class RemoteClient {
       })
 
       this.ws.on('error', (err) => {
-        console.error('[RemoteClient] WebSocket error:', err.message)
+        logger.error('[RemoteClient] WebSocket error:', err.message)
         if (!authResolved) {
           clearTimeout(authTimeout)
           authResolved = true
@@ -164,7 +165,7 @@ export class RemoteClient {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return
-    console.log('[RemoteClient] Reconnecting in 3 seconds...')
+    logger.log('[RemoteClient] Reconnecting in 3 seconds...')
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null
       if (!this.shouldReconnect) return
@@ -202,7 +203,7 @@ export class RemoteClient {
       this.ws = null
     }
 
-    console.log('[RemoteClient] Disconnected')
+    logger.log('[RemoteClient] Disconnected')
   }
 
   invoke(channel: string, args: unknown[], timeout = 30000): Promise<unknown> {

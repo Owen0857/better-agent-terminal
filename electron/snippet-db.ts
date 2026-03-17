@@ -1,6 +1,7 @@
 import { app } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
+import { logger } from './logger'
 
 // Snippet interface
 export type SnippetFormat = 'plaintext' | 'markdown'
@@ -48,7 +49,7 @@ class SnippetDatabase {
                 this.data = JSON.parse(raw)
             }
         } catch (error) {
-            console.error('Failed to load snippets:', error)
+            logger.error('Failed to load snippets:', error)
             this.data = { snippets: [], nextId: 1 }
         }
     }
@@ -61,7 +62,7 @@ class SnippetDatabase {
             }
             fs.writeFileSync(this.dataPath, JSON.stringify(this.data, null, 2), 'utf-8')
         } catch (error) {
-            console.error('Failed to save snippets:', error)
+            logger.error('Failed to save snippets:', error)
         }
     }
 

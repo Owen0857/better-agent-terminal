@@ -5,6 +5,7 @@ import * as fsPromises from 'fs/promises'
 import * as pathModule from 'path'
 import type { ClaudeMessage, ClaudeToolCall, ClaudeSessionState } from '../src/types/claude-agent'
 import type { Query, PermissionMode, CanUseTool, SlashCommand } from '@anthropic-ai/claude-agent-sdk'
+import { logger } from './logger'
 
 // App-level permission mode extends SDK's PermissionMode with planBypass
 // planBypass = plan mode (read-only exploration) + auto-approve all tool permissions
@@ -225,7 +226,7 @@ export class ClaudeAgentManager {
         // Load history from previous session if resuming
         if (previousSdkSessionId) {
           this.loadSessionHistory(sessionId, previousSdkSessionId, options.cwd).catch(e => {
-            console.warn('Failed to load session history on auto-resume:', e)
+            logger.warn('Failed to load session history on auto-resume:', e)
           })
         }
         return true
@@ -234,7 +235,7 @@ export class ClaudeAgentManager {
       await this.runQuery(sessionId, options.prompt)
       return true
     } catch (error) {
-      console.error('Failed to start Claude session:', error)
+      logger.error('Failed to start Claude session:', error)
       this.send('claude:error', sessionId, String(error))
       return false
     }
@@ -284,7 +285,7 @@ export class ClaudeAgentManager {
     try {
       const query = await getQuery()
       const claudeCodePath = resolveClaudeCodePath()
-      console.log(`[Claude] runQuery: cwd=${session.cwd}, resumeId=${resumeId || 'none'}, claudeCodePath=${claudeCodePath || 'none'}`)
+      logger.log(`[Claude] runQuery: cwd=${session.cwd}, resumeId=${resumeId || 'none'}, claudeCodePath=${claudeCodePath || 'none'}`)
       const canUseTool: CanUseTool = async (toolName, input, opts) => {
         // Check if this is an AskUserQuestion tool — always show UI
         if (toolName === 'AskUserQuestion') {
@@ -363,7 +364,7 @@ export class ClaudeAgentManager {
         canUseTool,
         ...(claudeCodePath ? { pathToClaudeCodeExecutable: claudeCodePath } : {}),
         stderr: (data: string) => {
-          console.error('[Claude Code stderr]', data)
+          logger.error('[Claude Code stderr]', data)
           stderrOutput += data
         },
       }
@@ -601,7 +602,7 @@ export class ClaudeAgentManager {
             let totalOutput = 0
             for (const [model, modelStats] of Object.entries(resultMsg.modelUsage)) {
               const line = `[Claude ctx] modelUsage[${model}]: input=${modelStats.inputTokens}, output=${modelStats.outputTokens}, contextWindow=${modelStats.contextWindow}`
-              console.log(line)
+              logger.log(line)
               totalInput += modelStats.inputTokens || 0
               totalOutput += modelStats.outputTokens || 0
               if (modelStats.contextWindow) {
@@ -609,12 +610,12 @@ export class ClaudeAgentManager {
               }
             }
             const summary = `[Claude ctx] prev: input=${session.metadata.inputTokens}, output=${session.metadata.outputTokens} | new: input=${totalInput}, output=${totalOutput} | cost=${resultMsg.total_cost_usd}`
-            console.log(summary)
+            logger.log(summary)
             session.metadata.inputTokens = totalInput
             session.metadata.outputTokens = totalOutput
           } else if (resultMsg.usage) {
             const line = `[Claude ctx] usage fallback: input=${resultMsg.usage.input_tokens}, output=${resultMsg.usage.output_tokens} | prev: input=${session.metadata.inputTokens}, output=${session.metadata.outputTokens}`
-            console.log(line)
+            logger.log(line)
             // Fallback: usage is session-cumulative (like total_cost_usd), assign directly
             session.metadata.inputTokens = resultMsg.usage.input_tokens || 0
             session.metadata.outputTokens = resultMsg.usage.output_tokens || 0
@@ -640,8 +641,8 @@ export class ClaudeAgentManager {
       if (!isAbort) {
         // If we were trying to resume and the process crashed, retry without resume
         if (resumeId && errMsg.includes('exited with code')) {
-          console.warn('Claude query failed with resume, retrying without resume:', errMsg)
-          if (stderrOutput) console.warn('stderr:', stderrOutput)
+          logger.warn('Claude query failed with resume, retrying without resume:', errMsg)
+          if (stderrOutput) logger.warn('stderr:', stderrOutput)
           session.sdkSessionId = undefined
           sdkSessionIds.delete(sessionId)
           session.state.isStreaming = false
@@ -655,10 +656,10 @@ export class ClaudeAgentManager {
           // Retry without resume
           return this.runQuery(sessionId, prompt, images)
         }
-        console.error('Claude query error:', error)
-        if (stderrOutput) console.error('stderr output:', stderrOutput)
+        logger.error('Claude query error:', error)
+        if (stderrOutput) logger.error('stderr output:', stderrOutput)
         if (error instanceof Error && error.stack) {
-          console.error('Stack:', error.stack)
+          logger.error('Stack:', error.stack)
         }
         // Include stderr hint in error message if available
         const displayMsg = stderrOutput
@@ -741,7 +742,7 @@ export class ClaudeAgentManager {
       await session.queryInstance.setPermissionMode(sdkMode)
       return true
     } catch (e) {
-      console.warn('setPermissionMode failed:', e)
+      logger.warn('setPermissionMode failed:', e)
       return false
     }
   }
@@ -756,19 +757,19 @@ export class ClaudeAgentManager {
 
     if (!session.queryInstance) {
       // No active query yet — model will be used when the next query starts
-      console.log(`[setModel] stored model ${model} for session ${sessionId.slice(0, 8)} (no active query)`)
+      logger.log(`[setModel] stored model ${model} for session ${sessionId.slice(0, 8)} (no active query)`)
       return true
     }
 
     try {
-      console.log(`[setModel] setting model to ${model} for session ${sessionId.slice(0, 8)}`)
+      logger.log(`[setModel] setting model to ${model} for session ${sessionId.slice(0, 8)}`)
       await session.queryInstance.setModel(model)
       this.send('claude:status', sessionId, { ...session.metadata })
-      console.log(`[setModel] success: ${model}`)
+      logger.log(`[setModel] success: ${model}`)
       return true
     } catch (e) {
       // Model is already stored on the session — it will take effect on the next query
-      console.warn(`[setModel] SDK call failed (model stored for next query):`, e)
+      logger.warn(`[setModel] SDK call failed (model stored for next query):`, e)
       return true
     }
   }
@@ -793,7 +794,7 @@ export class ClaudeAgentManager {
     try {
       return await session.queryInstance.supportedModels()
     } catch (e) {
-      console.warn('getSupportedModels failed:', e)
+      logger.warn('getSupportedModels failed:', e)
       return []
     }
   }
@@ -804,7 +805,7 @@ export class ClaudeAgentManager {
     try {
       return await session.queryInstance.accountInfo()
     } catch (e) {
-      console.warn('getAccountInfo failed:', e)
+      logger.warn('getAccountInfo failed:', e)
       return null
     }
   }
@@ -815,7 +816,7 @@ export class ClaudeAgentManager {
     try {
       return await session.queryInstance.supportedCommands()
     } catch (e) {
-      console.warn('getSupportedCommands failed:', e)
+      logger.warn('getSupportedCommands failed:', e)
       return []
     }
   }
@@ -863,7 +864,7 @@ export class ClaudeAgentManager {
           messageCount: 0, // SDK doesn't expose count directly
         }))
       } catch (e) {
-        console.warn('SDK listSessions failed, falling back to manual parse:', e)
+        logger.warn('SDK listSessions failed, falling back to manual parse:', e)
       }
     }
     return this.listSessionsFallback(cwd)

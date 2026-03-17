@@ -2,6 +2,7 @@ import { BrowserWindow } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import type { CreatePtyOptions } from '../src/types'
 import { broadcastHub } from './remote/broadcast-hub'
+import { logger } from './logger'
 
 // Try to import @lydell/node-pty, fall back to child_process if not available
 let pty: typeof import('@lydell/node-pty') | null = null
@@ -11,12 +12,12 @@ try {
   // Test if native module works by checking if spawn function exists and module is properly built
   if (pty && typeof pty.spawn === 'function') {
     ptyAvailable = true
-    console.log('node-pty loaded successfully (using @lydell/node-pty)')
+    logger.log('node-pty loaded successfully (using @lydell/node-pty)')
   } else {
-    console.warn('node-pty loaded but spawn function not available')
+    logger.warn('node-pty loaded but spawn function not available')
   }
 } catch (e) {
-  console.warn('@lydell/node-pty not available, falling back to child_process:', e)
+  logger.warn('@lydell/node-pty not available, falling back to child_process:', e)
 }
 
 interface PtyInstance {
@@ -137,9 +138,9 @@ export class PtyManager {
 
         this.instances.set(id, { process: ptyProcess, type, cwd, usePty: true })
         usedPty = true
-        console.log('Created terminal using node-pty')
+        logger.log('Created terminal using node-pty')
       } catch (e) {
-        console.warn('node-pty spawn failed, falling back to child_process:', e)
+        logger.warn('node-pty spawn failed, falling back to child_process:', e)
         ptyAvailable = false // Don't try again
       }
     }
@@ -196,7 +197,7 @@ export class PtyManager {
         })
 
         childProcess.on('error', (error) => {
-          console.error('Child process error:', error)
+          logger.error('Child process error:', error)
           this.broadcast('pty:output', id, `\r\n[Error: ${error.message}]\r\n`)
         })
 
@@ -204,9 +205,9 @@ export class PtyManager {
         this.broadcast('pty:output', id, `[Terminal - child_process mode]\r\n`)
 
         this.instances.set(id, { process: childProcess, type, cwd, usePty: false })
-        console.log('Created terminal using child_process fallback')
+        logger.log('Created terminal using child_process fallback')
       } catch (error) {
-        console.error('Failed to create terminal:', error)
+        logger.error('Failed to create terminal:', error)
         return false
       }
     }

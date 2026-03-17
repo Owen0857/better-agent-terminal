@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { invokeHandler } from './handler-registry'
+import { logger } from '../logger'
 import { broadcastHub } from './broadcast-hub'
 import { PROXIED_EVENTS, type RemoteFrame } from './protocol'
 
@@ -56,7 +57,7 @@ export class RemoteServer {
         JSON.stringify({ token }, null, 2)
       )
     } catch (e) {
-      console.warn('[RemoteServer] Failed to persist token:', e)
+      logger.warn('[RemoteServer] Failed to persist token:', e)
     }
   }
 
@@ -99,7 +100,7 @@ export class RemoteServer {
               connectedAt: Date.now()
             })
             this.sendFrame(ws, { type: 'auth-result', id: frame.id, result: true })
-            console.log(`[RemoteServer] Client authenticated: ${this.clients.get(ws)?.label}`)
+            logger.log(`[RemoteServer] Client authenticated: ${this.clients.get(ws)?.label}`)
           } else {
             this.sendFrame(ws, { type: 'auth-result', id: frame.id, error: 'Invalid token' })
             ws.close()
@@ -140,13 +141,13 @@ export class RemoteServer {
         clearTimeout(authTimeout)
         const client = this.clients.get(ws)
         if (client) {
-          console.log(`[RemoteServer] Client disconnected: ${client.label}`)
+          logger.log(`[RemoteServer] Client disconnected: ${client.label}`)
         }
         this.clients.delete(ws)
       })
 
       ws.on('error', (err) => {
-        console.error('[RemoteServer] WebSocket error:', err.message)
+        logger.error('[RemoteServer] WebSocket error:', err.message)
         this.clients.delete(ws)
       })
     })
@@ -182,7 +183,7 @@ export class RemoteServer {
       }
     }, 30000)
 
-    console.log(`[RemoteServer] Started on port ${port}, token: ${this.token.substring(0, 8)}...`)
+    logger.log(`[RemoteServer] Started on port ${port}, token: ${this.token.substring(0, 8)}...`)
     return { port, token: this.token }
   }
 
@@ -208,7 +209,7 @@ export class RemoteServer {
       this.wss = null
     }
 
-    console.log('[RemoteServer] Stopped')
+    logger.log('[RemoteServer] Stopped')
   }
 
   private sendFrame(ws: WebSocket, frame: RemoteFrame): void {

@@ -40,13 +40,14 @@ import { broadcastHub } from './remote/broadcast-hub'
 import { PROXIED_CHANNELS } from './remote/protocol'
 import { RemoteServer } from './remote/remote-server'
 import { RemoteClient } from './remote/remote-client'
+import { logger } from './logger'
 
 // Global error handlers — prevent silent crashes in main process
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error)
+  logger.error('Uncaught exception:', error)
 })
 process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection:', reason)
+  logger.error('Unhandled rejection:', reason)
 })
 
 // GPU / DWM safety — reduce GPU compositing overhead to prevent DWM hangs during resize
@@ -234,13 +235,14 @@ const profileArg = process.argv.find(a => a.startsWith('--profile='))
 const launchProfileId = profileArg ? profileArg.split('=')[1] || null : null
 
 app.whenReady().then(async () => {
+  logger.init(app.getPath('userData'))
   buildMenu()
   remoteServer.configDir = app.getPath('userData')
   createWindow()
 
   // Listen for system resume from sleep/hibernate
   powerMonitor.on('resume', () => {
-    console.log('System resumed from sleep')
+    logger.log('System resumed from sleep')
     for (const win of getAllWindows()) {
       win.webContents.send('system:resume')
     }
@@ -255,7 +257,7 @@ app.whenReady().then(async () => {
         buildMenu()
       }
     } catch (error) {
-      console.error('Failed to check for updates:', error)
+      logger.error('Failed to check for updates:', error)
     }
   }, 2000)
 })
@@ -572,7 +574,7 @@ function registerLocalHandlers() {
 
   ipcMain.handle('update:check', async () => {
     try { return await checkForUpdates() }
-    catch (error) { console.error('Failed to check for updates:', error); return { hasUpdate: false, currentVersion: app.getVersion(), latestRelease: null } }
+    catch (error) { logger.error('Failed to check for updates:', error); return { hasUpdate: false, currentVersion: app.getVersion(), latestRelease: null } }
   })
   ipcMain.handle('update:get-version', () => app.getVersion())
 
