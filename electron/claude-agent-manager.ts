@@ -107,6 +107,7 @@ interface SessionInstance {
   permissionMode: AppPermissionMode
   effort: 'low' | 'medium' | 'high' | 'max'
   enable1MContext: boolean
+  model?: string
   messageQueue: QueuedMessage[]
   isResting?: boolean
 }
@@ -356,6 +357,7 @@ export class ClaudeAgentManager {
         settingSources: ['user', 'project', 'local'],
         thinking: { type: 'adaptive' },
         effort: session.effort,
+        ...(session.model ? { model: session.model } : {}),
         ...(session.enable1MContext ? { betas: ['context-1m-2025-08-07'] } : {}),
         canUseTool,
         ...(claudeCodePath ? { pathToClaudeCodeExecutable: claudeCodePath } : {}),
@@ -759,6 +761,7 @@ export class ClaudeAgentManager {
     try {
       console.log(`[setModel] setting model to ${model} for session ${sessionId.slice(0, 8)}`)
       await session.queryInstance.setModel(model)
+      session.model = model
       session.metadata.model = model
       this.send('claude:status', sessionId, { ...session.metadata })
       console.log(`[setModel] success: ${model}`)
@@ -1136,6 +1139,7 @@ export class ClaudeAgentManager {
     const permissionMode = session.permissionMode
     const effort = session.effort
     const enable1MContext = session.enable1MContext
+    const model = session.model
 
     // Tear down old session completely
     session.abortController.abort()
@@ -1151,6 +1155,7 @@ export class ClaudeAgentManager {
       if (newSession) {
         newSession.effort = effort
         newSession.enable1MContext = enable1MContext
+        newSession.model = model
       }
     }
     return ok
