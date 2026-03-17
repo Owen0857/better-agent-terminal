@@ -1209,14 +1209,20 @@ export class ClaudeAgentManager {
           const textBlocks = content.filter((b: { type?: string }) => b.type === 'text')
           const assistantText = textBlocks.map((b: { text?: string }) => b.text || '').join('\n').trim()
 
+          // Strip task-notification XML blocks from assistant text (agent progress artifacts)
+          const cleanedAssistantText = assistantText
+            .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, '')
+            .replace(/Full transcript available at:.*$/gm, '')
+            .trim()
+
           // Filter out assistant noise
-          const isAssistantNoise = assistantText === 'No response requested.'
-          if ((assistantText || thinkingText) && !isAssistantNoise) {
+          const isAssistantNoise = cleanedAssistantText === 'No response requested.'
+          if ((cleanedAssistantText || thinkingText) && !isAssistantNoise) {
             const item = {
               id: `${obj.uuid || 'hist'}-text-${items.length}`,
               sessionId,
               role: 'assistant' as const,
-              content: assistantText || '',
+              content: cleanedAssistantText || '',
               ...(thinkingText ? { thinking: thinkingText } : {}),
               ...(obj.parent_tool_use_id ? { parentToolUseId: obj.parent_tool_use_id } : {}),
               timestamp: ts,
