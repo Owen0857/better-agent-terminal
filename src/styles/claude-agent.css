@@ -87,12 +87,31 @@
   text-overflow: ellipsis;
   opacity: 0.8;
 }
+.claude-active-task-progress {
+  font-size: calc(var(--claude-font-size) - 2px);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.claude-active-task-stalled {
+  font-size: calc(var(--claude-font-size) - 2px);
+  color: var(--warning-color, #e8a838);
+  font-weight: 600;
+}
+
 .claude-active-task-time {
   font-size: calc(var(--claude-font-size) - 2px);
   font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
   color: var(--claude-accent);
   opacity: 0.8;
   margin-left: auto;
+}
+
+.claude-active-task-item .claude-task-stop-btn {
+  margin-left: 4px;
 }
 
 .claude-messages {

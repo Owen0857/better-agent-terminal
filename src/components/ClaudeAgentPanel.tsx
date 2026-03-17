@@ -206,9 +206,9 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   // Combine archived + live messages for rendering and scanning
   const allMessages = useMemo(() => [...loadedArchive, ...messages], [loadedArchive, messages])
 
-  // Active tasks (running Task tool calls) for the indicator bar
+  // Active tasks (running Task/Agent tool calls) for the indicator bar
   const activeTasks = useMemo(() =>
-    allMessages.filter(m => isToolCall(m) && m.toolName === 'Task' && m.status === 'running') as ClaudeToolCall[]
+    allMessages.filter(m => isToolCall(m) && (m.toolName === 'Task' || m.toolName === 'Agent') && m.status === 'running') as ClaudeToolCall[]
   , [allMessages])
 
   // Tick counter to force re-render for elapsed time display
@@ -2049,6 +2049,8 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               : task.input.subagent_type
                 ? String(task.input.subagent_type)
                 : 'Task'
+            const progressDesc = task.description || ''
+            const isStalled = progressDesc.startsWith('[stalled]')
             return (
               <div
                 key={task.id}
@@ -2057,8 +2059,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               >
                 <span className="claude-active-task-dot" />
                 <span className="claude-active-task-label">{label}</span>
+                {progressDesc && !isStalled && <span className="claude-active-task-progress">{progressDesc}</span>}
+                {isStalled && <span className="claude-active-task-stalled">stalled</span>}
                 <span className="claude-active-task-time">{formatElapsed(task.timestamp)}</span>
                 {task.input.run_in_background && <span className="claude-task-tag">bg</span>}
+                <button className="claude-task-stop-btn" onClick={(e) => {
+                  e.stopPropagation()
+                  window.electronAPI.claude.stopTask(sessionId, task.id)
+                }}>Stop</button>
               </div>
             )
           })}
