@@ -2496,13 +2496,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <option value="high">high</option>
               <option value="max">max</option>
             </select>
-            <span
-              className={`claude-status-btn claude-1m-toggle${enable1MContext ? ' active' : ''}`}
-              onClick={handle1MContextToggle}
-              title="1M context window (Sonnet only)"
-            >
-              1M
-            </span>
             {accountInfo?.organization && (
               <span className="claude-status-btn claude-account-info" title={`${accountInfo.email || ''} (${accountInfo.subscriptionType || 'unknown'})`}>
                 {accountInfo.organization}
