@@ -7,9 +7,9 @@ import type { ClaudeMessage, ClaudeToolCall, ClaudeSessionState } from '../src/t
 import type { Query, PermissionMode, CanUseTool, SlashCommand } from '@anthropic-ai/claude-agent-sdk'
 import { logger } from './logger'
 
-// App-level permission mode extends SDK's PermissionMode with planBypass
-// planBypass = plan mode (read-only exploration) + auto-approve all tool permissions
-type AppPermissionMode = PermissionMode | 'planBypass'
+// App-level permission mode extends SDK's PermissionMode with bypassPlan
+// bypassPlan = plan mode (read-only exploration) + auto-approve all tool permissions
+type AppPermissionMode = PermissionMode | 'bypassPlan'
 import { broadcastHub } from './remote/broadcast-hub'
 
 // Lazy import the SDK (it's an ES module)
@@ -335,9 +335,9 @@ export class ClaudeAgentManager {
           })
         }
 
-        // In planBypass mode, auto-approve all tool calls except ExitPlanMode
+        // In bypassPlan mode, auto-approve all tool calls except ExitPlanMode
         // ExitPlanMode requires user confirmation before switching to bypass execution
-        if (session.permissionMode === 'planBypass') {
+        if (session.permissionMode === 'bypassPlan') {
           if (toolName === 'ExitPlanMode') {
             return new Promise((resolve) => {
               session.pendingPermissions.set(opts.toolUseID, {
@@ -362,7 +362,7 @@ export class ClaudeAgentManager {
           return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
         }
 
-        // In bypassPermissions mode (e.g. after planBypass → ExitPlanMode approval),
+        // In bypassPermissions mode (e.g. after bypassPlan → ExitPlanMode approval),
         // auto-approve all tool calls without prompting
         if (session.permissionMode === 'bypassPermissions') {
           return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
@@ -382,8 +382,8 @@ export class ClaudeAgentManager {
       }
 
       const currentMode = session.permissionMode
-      // Map app-level planBypass to SDK's plan mode
-      const sdkMode: PermissionMode = currentMode === 'planBypass' ? 'plan' : currentMode
+      // Map app-level bypassPlan to SDK's plan mode
+      const sdkMode: PermissionMode = currentMode === 'bypassPlan' ? 'plan' : currentMode
       const queryOptions: Record<string, unknown> = {
         abortController: session.abortController,
         cwd: session.cwd,
@@ -540,14 +540,14 @@ export class ClaudeAgentManager {
                 }
                 // Detect plan mode transitions and notify UI
                 if (toolBlock.name === 'EnterPlanMode') {
-                  // Preserve planBypass if already in it; otherwise set to plan
-                  if (session.permissionMode !== 'planBypass') {
+                  // Preserve bypassPlan if already in it; otherwise set to plan
+                  if (session.permissionMode !== 'bypassPlan') {
                     session.permissionMode = 'plan'
                   }
                   this.send('claude:modeChange', sessionId, session.permissionMode)
                 } else if (toolBlock.name === 'ExitPlanMode') {
-                  // In planBypass, mode transition is handled by canUseTool approval flow
-                  if (session.permissionMode !== 'planBypass') {
+                  // In bypassPlan, mode transition is handled by canUseTool approval flow
+                  if (session.permissionMode !== 'bypassPlan') {
                     session.permissionMode = 'default'
                     this.send('claude:modeChange', sessionId, 'default')
                   }
@@ -944,8 +944,8 @@ export class ClaudeAgentManager {
     session.permissionMode = mode
     if (!session.queryInstance) return true
     try {
-      // Map app-level planBypass to SDK's plan mode
-      const sdkMode: PermissionMode = mode === 'planBypass' ? 'plan' : mode
+      // Map app-level bypassPlan to SDK's plan mode
+      const sdkMode: PermissionMode = mode === 'bypassPlan' ? 'plan' : mode
       await session.queryInstance.setPermissionMode(sdkMode)
       return true
     } catch (e) {

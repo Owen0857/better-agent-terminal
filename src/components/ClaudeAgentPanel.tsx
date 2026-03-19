@@ -974,12 +974,12 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     textareaRef.current?.focus()
   }, [sessionId, isStreaming, isInterrupted])
 
-  const permissionModes = ['default', 'acceptEdits', 'bypassPermissions', 'planBypass', 'plan'] as const
+  const permissionModes = ['default', 'acceptEdits', 'bypassPermissions', 'bypassPlan', 'plan'] as const
   const permissionModeLabels: Record<string, string> = {
     default: '\u270F Ask before edits',
     acceptEdits: '\u270F Auto-accept edits',
     bypassPermissions: '\u26A0 Bypass permissions',
-    planBypass: '\uD83D\uDCCB Plan (auto-approve)',
+    bypassPlan: '\uD83D\uDCCB Plan (auto-approve)',
     plan: '\uD83D\uDCCB Plan mode',
   }
 
@@ -987,7 +987,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     const allowBypass = settingsStore.getSettings().allowBypassPermissions
     const availableModes = allowBypass
       ? permissionModes
-      : permissionModes.filter(m => m !== 'bypassPermissions' && m !== 'planBypass')
+      : permissionModes.filter(m => m !== 'bypassPermissions' && m !== 'bypassPlan')
     const idx = availableModes.indexOf(permissionMode as typeof availableModes[number])
     const nextMode = availableModes[(idx + 1) % availableModes.length]
     setPermissionMode(nextMode)
