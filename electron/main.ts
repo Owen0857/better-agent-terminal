@@ -41,6 +41,7 @@ import { broadcastHub } from './remote/broadcast-hub'
 import { PROXIED_CHANNELS } from './remote/protocol'
 import { RemoteServer } from './remote/remote-server'
 import { RemoteClient } from './remote/remote-client'
+import { getConnectionInfo } from './remote/tunnel-manager'
 import { logger } from './logger'
 
 // Startup timing — capture module load time before anything else
@@ -64,6 +65,9 @@ app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
 // Disable Service Workers — we don't use them, and a corrupted SW database
 // causes Chromium to block the renderer for 4+ seconds on Windows during I/O recovery.
 app.commandLine.appendSwitch('disable-features', 'ServiceWorker')
+
+// Set app name (shown in dock/taskbar instead of "Electron" during dev)
+app.setName('BetterAgentTerminal')
 
 // Set AppUserModelId for Windows taskbar pinning (must be before app.whenReady)
 if (process.platform === 'win32') {
@@ -212,8 +216,13 @@ function createWindow() {
     frame: true,
     titleBarStyle: 'default',
     title: 'Better Agent Terminal',
-    icon: path.join(__dirname, '../assets/icon.ico')
+    icon: path.join(__dirname, process.platform === 'win32' ? '../assets/icon.ico' : '../assets/icon.png')
   })
+
+  if (process.platform === 'darwin') {
+    const dockIcon = nativeImage.createFromPath(path.join(__dirname, '../assets/icon.png'))
+    app.dock.setIcon(dockIcon)
+  }
 
   ptyManager = new PtyManager(getAllWindows)
   claudeManager = new ClaudeAgentManager(getAllWindows)
@@ -304,16 +313,27 @@ app.whenReady().then(async () => {
   }, 2000)
 })
 
-app.on('before-quit', () => {
+// Cleanup runs once: before-quit covers cmd+Q / File→Quit paths,
+// window-all-closed covers the user closing the last window.
+// Guard with a flag to avoid running twice.
+let _cleanupDone = false
+function runCleanupOnce() {
+  if (_cleanupDone) return
+  _cleanupDone = true
   cleanupAllProcesses()
+}
+
+app.on('before-quit', () => {
+  runCleanupOnce()
 })
 
 app.on('window-all-closed', () => {
-  cleanupAllProcesses()
+  runCleanupOnce()
   if (process.platform !== 'darwin') {
     app.quit()
-    // Force exit after a short delay in case child processes keep the event loop alive
-    setTimeout(() => process.exit(0), 1000)
+    // Force exit — child processes (PTY shells, Claude CLI) may keep the event loop alive.
+    // PTY kill() already called taskkill /T above; this is a final safety net.
+    setTimeout(() => process.exit(0), 2000)
   }
 })
 
@@ -414,7 +434,7 @@ function registerProxiedHandlers() {
   registerHandler('claude:get-account-info', (sessionId: string) => claudeManager?.getAccountInfo(sessionId))
   registerHandler('claude:get-supported-commands', (sessionId: string) => claudeManager?.getSupportedCommands(sessionId))
   registerHandler('claude:get-session-meta', (sessionId: string) => claudeManager?.getSessionMeta(sessionId))
-  registerHandler('claude:resolve-permission', (sessionId: string, toolUseId: string, result: { behavior: string; updatedInput?: Record<string, unknown>; message?: string }) => claudeManager?.resolvePermission(sessionId, toolUseId, result))
+  registerHandler('claude:resolve-permission', (sessionId: string, toolUseId: string, result: { behavior: string; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[]; message?: string; dontAskAgain?: boolean }) => claudeManager?.resolvePermission(sessionId, toolUseId, result))
   registerHandler('claude:resolve-ask-user', (sessionId: string, toolUseId: string, answers: Record<string, string>) => claudeManager?.resolveAskUser(sessionId, toolUseId, answers))
   registerHandler('claude:list-sessions', (cwd: string) => claudeManager?.listSessions(cwd))
   registerHandler('claude:resume-session', (sessionId: string, sdkSessionId: string, cwd: string, model?: string) => claudeManager?.resumeSession(sessionId, sdkSessionId, cwd, model))
@@ -452,12 +472,25 @@ function registerProxiedHandlers() {
   })
 
   // Claude usage (5h / 7d rate limits)
-  registerHandler('claude:get-usage', async () => {
+  // Primary: session key from Chrome cookies (lenient rate limits on claude.ai)
+  // Fallback: OAuth token from Claude Code credentials (strict rate limits on api.anthropic.com)
+  let _cachedOAuthToken: string | null = null
+  let _cachedSessionKey: string | null = null
+  let _cachedOrgId: string | null = null
+  let _cachedCfClearance: string | null = null
+  let _tokenCacheTime = 0
+  let _sessionKeyCacheTime = 0
+  const TOKEN_CACHE_TTL = 10 * 60 * 1000     // 10 minutes
+  const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000 // 30 minutes
+
+  async function getOAuthToken(): Promise<string | null> {
+    const now = Date.now()
+    if (_cachedOAuthToken && now - _tokenCacheTime < TOKEN_CACHE_TTL) {
+      return _cachedOAuthToken
+    }
     try {
       let token: string | null = null
-
       if (process.platform === 'darwin') {
-        // macOS: read from Keychain
         const { execSync } = await import('child_process')
         const username = execSync('whoami', { encoding: 'utf-8' }).trim()
         const raw = execSync(
@@ -467,32 +500,226 @@ function registerProxiedHandlers() {
         const creds = JSON.parse(raw)
         token = creds?.claudeAiOauth?.accessToken ?? null
       } else {
-        // Windows / Linux: read from ~/.claude/.credentials.json
         const credPath = path.join(app.getPath('home'), '.claude', '.credentials.json')
         const raw = await fs.readFile(credPath, 'utf-8')
         const creds = JSON.parse(raw)
         token = creds?.claudeAiOauth?.accessToken ?? null
       }
+      if (token && token.startsWith('sk-ant-oat')) {
+        _cachedOAuthToken = token
+        _tokenCacheTime = now
+        return token
+      }
+      return null
+    } catch { return null }
+  }
 
-      if (!token || !token.startsWith('sk-ant-oat')) return null
+  /** Decrypt a Chrome v10 encrypted cookie value on macOS */
+  function decryptChromeCookie(encHex: string, derivedKey: Buffer): string | null {
+    try {
+      const crypto = require('crypto')
+      const encBuf = Buffer.from(encHex, 'hex')
+      if (encBuf.length < 4 || encBuf.toString('utf-8', 0, 3) !== 'v10') return null
+      const ciphertext = encBuf.subarray(3)
+      const iv = Buffer.alloc(16, 0x20) // 16 space characters
+      const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv)
+      let dec = decipher.update(ciphertext)
+      dec = Buffer.concat([dec, decipher.final()])
+      return dec.toString('utf-8').replace(/[\x00-\x1f]/g, '').trim()
+    } catch { return null }
+  }
 
-      const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+  /** Extract session key and cf_clearance from Chrome cookies on macOS */
+  async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    if (process.platform !== 'darwin') return null
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
+    }
+    try {
+      const crypto = await import('crypto')
+      const { execSync } = await import('child_process')
+      const os = await import('os')
+
+      // Copy Chrome cookies DB to temp to avoid WAL lock
+      const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
+      try { await fs.access(chromeCookiePath) } catch { return null }
+
+      const tmpDir = os.tmpdir()
+      const tmpDb = path.join(tmpDir, 'bat-chrome-cookies.db')
+      await fs.copyFile(chromeCookiePath, tmpDb)
+      // Also copy WAL and SHM files for consistency
+      try { await fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal') } catch { /* ok */ }
+      try { await fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm') } catch { /* ok */ }
+
+      // Get Chrome safe storage password from Keychain
+      const chromePassword = execSync(
+        'security find-generic-password -s "Chrome Safe Storage" -w 2>/dev/null',
+        { encoding: 'utf-8', timeout: 3000 }
+      ).trim()
+      if (!chromePassword) return null
+
+      const derivedKey = crypto.pbkdf2Sync(chromePassword, 'saltysalt', 1003, 16, 'sha1')
+
+      // Query sessionKey and cf_clearance
+      const rawOutput = execSync(
+        `sqlite3 "${tmpDb}" "SELECT name, hex(encrypted_value) FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance');"`,
+        { encoding: 'utf-8', timeout: 5000 }
+      ).trim()
+
+      // Clean up temp files
+      try { await fs.unlink(tmpDb) } catch { /* ok */ }
+      try { await fs.unlink(tmpDb + '-wal') } catch { /* ok */ }
+      try { await fs.unlink(tmpDb + '-shm') } catch { /* ok */ }
+
+      if (!rawOutput) return null
+
+      let sessionKey: string | null = null
+      let cfClearance: string | null = null
+
+      for (const line of rawOutput.split('\n')) {
+        const [name, hex] = line.split('|')
+        if (!hex) continue
+        const decrypted = decryptChromeCookie(hex, derivedKey as unknown as Buffer)
+        if (!decrypted) continue
+
+        // Strip non-ASCII chars from decrypted values
+        const cleaned = decrypted.replace(/[^\x20-\x7E]/g, '').trim()
+        if (name === 'sessionKey') {
+          // Decrypted value may have garbage prefix; extract from sk-ant-sid
+          const idx = cleaned.indexOf('sk-ant-sid')
+          sessionKey = idx >= 0 ? cleaned.substring(idx) : cleaned
+        } else if (name === 'cf_clearance') {
+          cfClearance = cleaned
+        }
+      }
+
+      if (!sessionKey || sessionKey.length < 10) return null
+
+      _cachedSessionKey = sessionKey
+      _cachedCfClearance = cfClearance
+      _sessionKeyCacheTime = now
+      logger.log('[usage] Extracted session key from Chrome (length:', sessionKey.length, ')')
+      return { sessionKey, cfClearance }
+    } catch (e) {
+      logger.error('[usage] Failed to extract Chrome session key:', e)
+      return null
+    }
+  }
+
+  /** Auto-detect organization ID using session key */
+  async function getOrgId(sessionKey: string, cfClearance: string | null): Promise<string | null> {
+    if (_cachedOrgId) return _cachedOrgId
+    try {
+      const cookieParts = [`sessionKey=${sessionKey}`]
+      if (cfClearance) cookieParts.push(`cf_clearance=${cfClearance}`)
+
+      const res = await fetch('https://claude.ai/api/organizations', {
         headers: {
-          'Authorization': `Bearer ${token}`,
-          'anthropic-beta': 'oauth-2025-04-20',
-          'User-Agent': 'claude-code/2.0.32',
           'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Cookie': cookieParts.join('; '),
         },
       })
-      if (!res.ok) return null
-      const data = await res.json()
-      return {
-        fiveHour: data.five_hour?.utilization ?? null,
-        sevenDay: data.seven_day?.utilization ?? null,
-        fiveHourReset: data.five_hour?.resets_at ?? null,
-        sevenDayReset: data.seven_day?.resets_at ?? null,
+      if (!res.ok) {
+        logger.error('[usage] Organizations API returned', res.status)
+        return null
       }
-    } catch { return null }
+      const orgs = await res.json()
+      if (!Array.isArray(orgs) || orgs.length === 0) {
+        logger.error('[usage] No organizations found')
+        return null
+      }
+      _cachedOrgId = orgs[0].uuid
+      logger.log('[usage] Auto-detected org ID:', _cachedOrgId)
+      return _cachedOrgId
+    } catch (e) {
+      logger.error('[usage] getOrgId failed:', e)
+      return null
+    }
+  }
+
+  /** Fetch usage via session key (primary — lenient rate limits) */
+  async function fetchUsageViaSessionKey(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null> {
+    const creds = await getSessionKeyFromChrome()
+    if (!creds) return null
+    const orgId = await getOrgId(creds.sessionKey, creds.cfClearance)
+    if (!orgId) return null
+
+    const cookieParts = [`sessionKey=${creds.sessionKey}`]
+    if (creds.cfClearance) cookieParts.push(`cf_clearance=${creds.cfClearance}`)
+
+    const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Cookie': cookieParts.join('; '),
+      },
+    })
+
+    if (res.status === 401 || res.status === 403) {
+      _cachedSessionKey = null
+      _cachedOrgId = null
+      _cachedCfClearance = null
+      _sessionKeyCacheTime = 0
+      logger.log('[usage] Session key expired or blocked, will re-extract')
+      return null
+    }
+    if (!res.ok) return null
+
+    const data = await res.json()
+    logger.log('[usage] [session-key] 5h=', data.five_hour?.utilization, 'reset=', data.five_hour?.resets_at, '7d=', data.seven_day?.utilization, 'reset=', data.seven_day?.resets_at)
+    return {
+      fiveHour: data.five_hour?.utilization ?? null,
+      sevenDay: data.seven_day?.utilization ?? null,
+      fiveHourReset: data.five_hour?.resets_at ?? null,
+      sevenDayReset: data.seven_day?.resets_at ?? null,
+    }
+  }
+
+  /** Fetch usage via OAuth (fallback — strict rate limits) */
+  async function fetchUsageViaOAuth(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | 'rateLimited' | null> {
+    const token = await getOAuthToken()
+    if (!token) return null
+
+    const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'claude-code/2.0.32',
+        'Accept': 'application/json',
+      },
+    })
+
+    if (res.status === 429) return 'rateLimited'
+    if (!res.ok) return null
+
+    const data = await res.json()
+    logger.log('[usage] [oauth] 5h=', data.five_hour?.utilization, '7d=', data.seven_day?.utilization)
+    return {
+      fiveHour: data.five_hour?.utilization ?? null,
+      sevenDay: data.seven_day?.utilization ?? null,
+      fiveHourReset: data.five_hour?.resets_at ?? null,
+      sevenDayReset: data.seven_day?.resets_at ?? null,
+    }
+  }
+
+  registerHandler('claude:get-usage', async () => {
+    try {
+      // Try session key first (lenient rate limits on claude.ai)
+      const sessionResult = await fetchUsageViaSessionKey()
+      if (sessionResult) return sessionResult
+
+      // Fall back to OAuth (strict rate limits on api.anthropic.com)
+      const oauthResult = await fetchUsageViaOAuth()
+      if (oauthResult === 'rateLimited') {
+        return { rateLimited: true, retryAfterSec: 120 }
+      }
+      return oauthResult
+    } catch (e) {
+      logger.error('[usage] get-usage failed:', e)
+      return null
+    }
   })
 
   // Git
@@ -548,6 +775,12 @@ function registerProxiedHandlers() {
         return { status: tab > 0 ? line.substring(0, tab).trim() : line.charAt(0), file: tab > 0 ? line.substring(tab + 1) : line.substring(2) }
       })
     } catch { return [] }
+  })
+  registerHandler('git:getRoot', async (cwd: string) => {
+    try {
+      const { execSync } = await import('child_process')
+      return execSync('git rev-parse --show-toplevel', { cwd, encoding: 'utf-8', timeout: 5000 }).trim()
+    } catch { return null }
   })
   registerHandler('git:status', async (cwd: string) => {
     try {
@@ -608,6 +841,12 @@ function registerProxiedHandlers() {
   registerHandler('snippet:search', (query: string) => snippetDb.search(query))
   registerHandler('snippet:getCategories', () => snippetDb.getCategories())
   registerHandler('snippet:getFavorites', () => snippetDb.getFavorites())
+
+  // Profile (subset exposed to remote clients)
+  registerHandler('profile:list', () => profileManager.list())
+  registerHandler('profile:load', (profileId: string) => profileManager.load(profileId))
+  registerHandler('profile:get-active-id', () => profileManager.getActiveProfileId())
+  registerHandler('profile:set-active', (profileId: string) => profileManager.setActiveProfileId(profileId))
 }
 
 // ── Bind all proxied handlers to ipcMain ──
@@ -633,12 +872,16 @@ ipcMain.on('debug:log', (_event, ...args: unknown[]) => {
 
 function registerLocalHandlers() {
   ipcMain.handle('dialog:select-folder', async () => {
-    const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openDirectory'] })
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      defaultPath: app.getPath('home'),
+      properties: ['openDirectory'],
+    })
     return result.canceled ? null : result.filePaths[0]
   })
 
   ipcMain.handle('dialog:select-images', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {
+      defaultPath: app.getPath('home'),
       filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
       properties: ['openFile', 'multiSelections'],
     })
@@ -704,6 +947,26 @@ function registerLocalHandlers() {
     clients: remoteServer.connectedClients
   }))
 
+  // Mobile QR code connection: ensure server is running, return connection URL
+  ipcMain.handle('tunnel:get-connection', async () => {
+    try {
+      let port: number
+      let token: string
+      if (!remoteServer.isRunning) {
+        const result = remoteServer.start()
+        port = result.port
+        token = result.token
+      } else {
+        port = remoteServer.port!
+        const tokenPath = path.join(app.getPath('userData'), 'server-token.json')
+        token = JSON.parse(fsSync.readFileSync(tokenPath, 'utf-8')).token
+      }
+      return getConnectionInfo(port, token)
+    } catch (err: unknown) {
+      return { error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
   // Remote client handlers
   ipcMain.handle('remote:connect', async (_event, host: string, port: number, token: string, label?: string) => {
     try {
@@ -739,18 +1002,14 @@ function registerLocalHandlers() {
     }
   })
 
-  // Profile handlers (always local)
-  ipcMain.handle('profile:list', async () => profileManager.list())
+  // Profile handlers (local-only — list/load/set-active/get-active-id are proxied)
   ipcMain.handle('profile:create', async (_event, name: string, options?: { type?: 'local' | 'remote'; remoteHost?: string; remotePort?: number; remoteToken?: string }) => profileManager.create(name, options))
   ipcMain.handle('profile:save', async (_event, profileId: string) => profileManager.save(profileId))
-  ipcMain.handle('profile:load', async (_event, profileId: string) => profileManager.load(profileId))
   ipcMain.handle('profile:delete', async (_event, profileId: string) => profileManager.delete(profileId))
   ipcMain.handle('profile:rename', async (_event, profileId: string, newName: string) => profileManager.rename(profileId, newName))
   ipcMain.handle('profile:duplicate', async (_event, profileId: string, newName: string) => profileManager.duplicate(profileId, newName))
   ipcMain.handle('profile:update', async (_event, profileId: string, updates: { remoteHost?: string; remotePort?: number; remoteToken?: string }) => profileManager.update(profileId, updates))
   ipcMain.handle('profile:get', async (_event, profileId: string) => profileManager.getProfile(profileId))
-  ipcMain.handle('profile:set-active', async (_event, profileId: string) => profileManager.setActiveProfileId(profileId))
-  ipcMain.handle('profile:get-active-id', async () => profileManager.getActiveProfileId())
 
   // Get the profile ID this instance was launched with (--profile= argument)
   ipcMain.handle('app:get-launch-profile', () => launchProfileId)

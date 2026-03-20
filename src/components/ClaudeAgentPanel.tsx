@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment, cloneElement, isValidElement } from 'react'
+import { flushSync } from 'react-dom'
+import { useTranslation } from 'react-i18next'
 import type { ClaudeMessage, ClaudeToolCall } from '../types/claude-agent'
 import { isToolCall } from '../types/claude-agent'
 import { settingsStore } from '../stores/settings-store'
@@ -81,6 +83,7 @@ type MessageItem = ClaudeMessage | ClaudeToolCall
 const startedSessions = new Set<string>()
 
 export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Readonly<ClaudeAgentPanelProps>) {
+  const { t } = useTranslation()
   const [messages, setMessages] = useState<MessageItem[]>([])
   const inputValueRef = useRef('')
   const [isStreaming, setIsStreaming] = useState(false)
@@ -91,7 +94,18 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   const [showThinking, setShowThinking] = useState(false)
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set())
   const [autoExpandThinking, setAutoExpandThinking] = useState(false)
-  const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(null)
+  const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(() => {
+    // Restore persisted session metadata for status line on resume
+    const t = workspaceStore.getState().terminals.find(t => t.id === sessionId)
+    if (t?.sessionMeta) {
+      return {
+        ...t.sessionMeta,
+        model: t.model,
+        sdkSessionId: t.sdkSessionId,
+      }
+    }
+    return null
+  })
   const [hasSdkSession, setHasSdkSession] = useState(() => {
     const t = workspaceStore.getState().terminals.find(t => t.id === sessionId)
     return !!t?.sdkSessionId
@@ -117,8 +131,15 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   const [resumeLoading, setResumeLoading] = useState(false)
   const [showModelList, setShowModelList] = useState(false)
   const [contentModal, setContentModal] = useState<{ title: string; content: string } | null>(null)
+  // Subagent message storage (keyed by parent Task tool_use_id)
+  const subagentMessagesRef = useRef<Map<string, MessageItem[]>>(new Map())
+  const [subagentStreamingText, setSubagentStreamingText] = useState<Map<string, string>>(new Map())
+  const [subagentStreamingThinking, setSubagentStreamingThinking] = useState<Map<string, string>>(new Map())
+  const [taskModal, setTaskModal] = useState<{ taskId: string; label: string; subagentType?: string } | null>(null)
+  const [taskModalTick, setTaskModalTick] = useState(0)
   const [showPromptHistory, setShowPromptHistory] = useState(false)
   const [promptSuggestion, setPromptSuggestion] = useState<string | null>(null)
+  const [statuslineConfig, setStatuslineConfig] = useState(settingsStore.getStatuslineItems())
   const [accountInfo, setAccountInfo] = useState<{ email?: string; organization?: string; subscriptionType?: string } | null>(null)
   const [slashCommands, setSlashCommands] = useState<SlashCommandInfo[]>([])
   const [showSlashMenu, setShowSlashMenu] = useState(false)
@@ -147,7 +168,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   const inputHistoryRef = useRef<string[]>([])
   const inputHistoryIndexRef = useRef(-1)
   const inputDraftRef = useRef('')
-  const initialModeAppliedRef = useRef(false)
   const pendingPromptSentRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const streamingThinkingRef = useRef<HTMLPreElement>(null)
@@ -201,9 +221,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   const allMessages = useMemo(() => [...loadedArchive, ...messages], [loadedArchive, messages])
 
   // Active tasks (running Task/Agent tool calls) for the indicator bar
-  const activeTasks = useMemo(() =>
-    allMessages.filter(m => isToolCall(m) && (m.toolName === 'Task' || m.toolName === 'Agent') && m.status === 'running') as ClaudeToolCall[]
-  , [allMessages])
+  const activeTasks = useMemo(() => {
+    const tasks = allMessages.filter(m => isToolCall(m) && (m.toolName === 'Task' || m.toolName === 'Agent') && m.status === 'running') as ClaudeToolCall[]
+    const allTaskTools = allMessages.filter(m => isToolCall(m) && (m.toolName === 'Task' || m.toolName === 'Agent')) as ClaudeToolCall[]
+    if (allTaskTools.length > 0) {
+      window.electronAPI.debug.log(`[renderer] activeTasks: ${tasks.length} running / ${allTaskTools.length} total Task/Agent tools (statuses: ${allTaskTools.map(t => `${t.id?.slice(0,8)}=${t.status}`).join(', ')})`)
+    }
+    return tasks
+  }, [allMessages])
 
   // Tick counter to force re-render for elapsed time display
   const [, setElapsedTick] = useState(0)
@@ -361,7 +386,29 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
           setStreamingText('')
           setStreamingThinking('')
           setIsStreaming(false)
-          setSessionMeta(null)
+          // Restore persisted metadata instead of resetting to null (preserves status line on resume)
+          const savedTerminal = workspaceStore.getState().terminals.find(t => t.id === sessionId)
+          if (savedTerminal?.sessionMeta) {
+            setSessionMeta({
+              ...savedTerminal.sessionMeta,
+              model: savedTerminal.model,
+              sdkSessionId: savedTerminal.sdkSessionId,
+            })
+          } else {
+            setSessionMeta(null)
+          }
+          return
+        }
+        // Route subagent messages to separate bucket
+        if (message.parentToolUseId) {
+          const bucket = subagentMessagesRef.current.get(message.parentToolUseId) || []
+          if (!bucket.some(m => m.id === message.id)) {
+            bucket.push(message)
+            subagentMessagesRef.current.set(message.parentToolUseId, bucket)
+            if (taskModal?.taskId === message.parentToolUseId) setTaskModalTick(t => t + 1)
+          }
+          setSubagentStreamingText(prev => { const n = new Map(prev); n.delete(message.parentToolUseId!); return n })
+          setSubagentStreamingThinking(prev => { const n = new Map(prev); n.delete(message.parentToolUseId!); return n })
           return
         }
         // Deduplicate by id; attach streaming thinking if backend didn't provide it
@@ -382,10 +429,24 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         if (sid !== sessionId) return
         workspaceStore.updateTerminalActivity(sessionId)
         const toolCall = tool as ClaudeToolCall
-        setMessages(prev => {
+        window.electronAPI.debug.log(`[renderer] onToolUse name=${toolCall.toolName} id=${toolCall.id?.slice(0, 12)} status=${toolCall.status} parentToolUseId=${toolCall.parentToolUseId || 'none'}`)
+        // Route subagent tool calls to separate bucket
+        if (toolCall.parentToolUseId) {
+          const bucket = subagentMessagesRef.current.get(toolCall.parentToolUseId) || []
+          if (!bucket.some(m => 'toolName' in m && m.id === toolCall.id)) {
+            bucket.push(toolCall)
+            subagentMessagesRef.current.set(toolCall.parentToolUseId, bucket)
+            if (taskModal?.taskId === toolCall.parentToolUseId) setTaskModalTick(t => t + 1)
+          }
+          return
+        }
+        // Use flushSync for Agent/Task tools to ensure the active tasks bar renders immediately
+        const isAgentTool = toolCall.toolName === 'Agent' || toolCall.toolName === 'Task'
+        const doUpdate = () => setMessages(prev => {
           if (prev.some(m => 'toolName' in m && m.id === toolCall.id)) return prev
           return [...prev, toolCall]
         })
+        if (isAgentTool) { flushSync(doUpdate) } else { doUpdate() }
       }),
 
       api.onToolResult((sid: string, result: unknown) => {
@@ -395,12 +456,32 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         if ((updates as { description?: string }).description) {
           window.electronAPI.debug.log(`[renderer] onToolResult description update id=${id} desc=${(updates as { description?: string }).description}`)
         }
-        setMessages(prev => prev.map(m => {
+        // Check if tool exists in any subagent bucket
+        let foundInSubagent = false
+        for (const [parentId, bucket] of subagentMessagesRef.current.entries()) {
+          const idx = bucket.findIndex(m => 'toolName' in m && m.id === id)
+          if (idx !== -1) {
+            bucket[idx] = { ...bucket[idx], ...updates } as ClaudeToolCall
+            foundInSubagent = true
+            if (taskModal?.taskId === parentId) setTaskModalTick(t => t + 1)
+            break
+          }
+        }
+        if (foundInSubagent) return
+        // Check if this is an Agent/Task status change (needs immediate render for active tasks bar)
+        const isAgentStatusChange = updates.status && updates.status !== 'running'
+        const doResultUpdate = () => setMessages(prev => prev.map(m => {
           if ('toolName' in m && m.id === id) {
+            // When a Task tool completes, clear its subagent streaming state
+            if (m.toolName === 'Task') {
+              setSubagentStreamingText(p => { const n = new Map(p); n.delete(id); return n })
+              setSubagentStreamingThinking(p => { const n = new Map(p); n.delete(id); return n })
+            }
             return { ...m, ...updates } as ClaudeToolCall
           }
           return m
         }))
+        if (isAgentStatusChange) { flushSync(doResultUpdate) } else { doResultUpdate() }
       }),
 
       api.onResult((sid: string, resultData: unknown) => {
@@ -409,6 +490,8 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         setIsInterrupted(false)
         setStreamingText('')
         setStreamingThinking('')
+        // Refresh usage after agent activity (usage likely changed)
+        workspaceStore.refreshUsageNow()
         // Show result text only for slash commands that don't produce assistant messages
         const rd = resultData as { result?: string; subtype?: string } | undefined
         if (rd?.result && rd.subtype === 'success') {
@@ -447,9 +530,27 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       api.onStream((sid: string, data: unknown) => {
         if (sid !== sessionId) return
         workspaceStore.updateTerminalActivity(sessionId)
-        const d = data as { text?: string; thinking?: string }
-        if (d.text) setStreamingText(prev => prev + d.text)
-        if (d.thinking) setStreamingThinking(prev => prev + d.thinking)
+        const d = data as { text?: string; thinking?: string; parentToolUseId?: string }
+        if (d.parentToolUseId) {
+          // Route to per-subagent streaming state
+          if (d.text) {
+            setSubagentStreamingText(prev => {
+              const n = new Map(prev)
+              n.set(d.parentToolUseId!, (prev.get(d.parentToolUseId!) || '') + d.text)
+              return n
+            })
+          }
+          if (d.thinking) {
+            setSubagentStreamingThinking(prev => {
+              const n = new Map(prev)
+              n.set(d.parentToolUseId!, (prev.get(d.parentToolUseId!) || '') + d.thinking)
+              return n
+            })
+          }
+        } else {
+          if (d.text) setStreamingText(prev => prev + d.text)
+          if (d.thinking) setStreamingThinking(prev => prev + d.thinking)
+        }
       }),
 
       api.onStatus((sid: string, meta: unknown) => {
@@ -462,11 +563,19 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         const m = meta as SessionMeta
         setSessionMeta(m)
         if (m.model) setCurrentModel(prev => prev || m.model!)
-        // On first status, ensure bypass mode is applied
-        if (!initialModeAppliedRef.current) {
-          initialModeAppliedRef.current = true
-          window.electronAPI.claude.setPermissionMode(sessionId, 'bypassPermissions')
-        } else if (m.permissionMode) {
+        // Persist session metadata for status line restoration on next app launch
+        if (m.contextWindow > 0 || m.totalCost > 0 || m.inputTokens > 0) {
+          workspaceStore.setTerminalSessionMeta(sessionId, {
+            totalCost: m.totalCost,
+            inputTokens: m.inputTokens,
+            outputTokens: m.outputTokens,
+            durationMs: m.durationMs,
+            numTurns: m.numTurns,
+            contextWindow: m.contextWindow,
+          })
+        }
+        // Sync UI with backend's current permission mode
+        if (m.permissionMode) {
           setPermissionMode(m.permissionMode)
         }
         // Persist SDK session ID per-terminal so /resume and auto-resume can find it
@@ -498,8 +607,21 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         const dlog2 = (...args: unknown[]) => window.electronAPI?.debug?.log(...args)
         dlog2(`${tag} onHistory items=${(items as unknown[]).length} pendingPromptSent=${pendingPromptSentRef.current}`)
         historyLoadedRef.current = true
-        // Replace messages with the full history batch and clear archive state
-        const historyItems = items as MessageItem[]
+        // Partition history items: main timeline vs subagent buckets
+        const mainItems: MessageItem[] = []
+        const subagentBuckets = new Map<string, MessageItem[]>()
+        for (const item of items as MessageItem[]) {
+          const parentId = (item as { parentToolUseId?: string }).parentToolUseId
+          if (parentId) {
+            const bucket = subagentBuckets.get(parentId) || []
+            bucket.push(item)
+            subagentBuckets.set(parentId, bucket)
+          } else {
+            mainItems.push(item)
+          }
+        }
+        subagentMessagesRef.current = subagentBuckets
+        const historyItems = mainItems
         setLoadedArchive([])
         archivedCountRef.current = 0
         loadedFromArchiveRef.current = 0
@@ -534,13 +656,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
 
       api.onModeChange((sid: string, mode: string) => {
         if (sid !== sessionId) return
-        // When exiting plan mode, restore to bypass
-        if (mode === 'default') {
-          setPermissionMode('bypassPermissions')
-          window.electronAPI.claude.setPermissionMode(sessionId, 'bypassPermissions')
-        } else {
-          setPermissionMode(mode)
-        }
+        setPermissionMode(mode)
       }),
 
       api.onPromptSuggestion((sid: string, suggestion: string) => {
@@ -579,7 +695,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         window.electronAPI.claude.resumeSession(sessionId, savedSdkSessionId, cwd, savedModel)
       } else {
         dlog(`${stag} FRESH startSession`)
-        window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode: 'bypassPermissions', model: savedModel })
+        window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode, model: savedModel })
       }
     }
     return () => {
@@ -622,10 +738,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     window.electronAPI.git.getBranch(cwd).then(branch => setGitBranch(branch)).catch(() => setGitBranch(null))
   }, [cwd])
 
-  // Subscribe to font size changes from settings
+  // Subscribe to settings changes (font size, statusline config)
   useEffect(() => {
     return settingsStore.subscribe(() => {
       setClaudeFontSize(settingsStore.getSettings().fontSize)
+      setStatuslineConfig(settingsStore.getStatuslineItems())
     })
   }, [])
 
@@ -851,24 +968,22 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     textareaRef.current?.focus()
   }, [sessionId, isStreaming, isInterrupted])
 
-  const permissionModes = ['default', 'acceptEdits', 'bypassPermissions', 'planBypass', 'plan'] as const
+  const permissionModes = ['default', 'acceptEdits', 'bypassPermissions', 'bypassPlan', 'plan'] as const
   const permissionModeLabels: Record<string, string> = {
     default: '\u270F Ask before edits',
     acceptEdits: '\u270F Auto-accept edits',
     bypassPermissions: '\u26A0 Bypass permissions',
-    planBypass: '\uD83D\uDCCB Plan (auto-approve)',
+    bypassPlan: '\uD83D\uDCCB Plan (auto-approve)',
     plan: '\uD83D\uDCCB Plan mode',
   }
 
   const handlePermissionModeCycle = useCallback(async () => {
-    const idx = permissionModes.indexOf(permissionMode as typeof permissionModes[number])
-    const nextMode = permissionModes[(idx + 1) % permissionModes.length]
-    if ((nextMode === 'bypassPermissions' || nextMode === 'planBypass') && !settingsStore.getSettings().allowBypassPermissions) {
-      const confirmed = await window.electronAPI.dialog.confirm('Warning: This mode allows tool calls without confirmation. Continue?')
-      if (!confirmed) {
-        return
-      }
-    }
+    const allowBypass = settingsStore.getSettings().allowBypassPermissions
+    const availableModes = allowBypass
+      ? permissionModes
+      : permissionModes.filter(m => m !== 'bypassPermissions' && m !== 'bypassPlan')
+    const idx = availableModes.indexOf(permissionMode as typeof availableModes[number])
+    const nextMode = availableModes[(idx + 1) % availableModes.length]
     setPermissionMode(nextMode)
     await window.electronAPI.claude.setPermissionMode(sessionId, nextMode)
   }, [sessionId, permissionMode])
@@ -998,27 +1113,56 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     await window.electronAPI.claude.set1MContext(sessionId, next)
   }, [sessionId, enable1MContext])
 
-  const PERMISSION_OPTION_COUNT = 4 // 0=Yes, 1=Yes always, 2=No, 3=custom text
+  const showDontAskAgain = (pendingPermission?.suggestions?.length ?? 0) > 0
+    || pendingPermission?.toolName === 'ExitPlanMode'
+
+  const dontAskAgainLabel = useMemo(() => {
+    if (!pendingPermission?.suggestions?.length) return t('claude.yesDontAskAgain')
+    const suggestion = pendingPermission.suggestions[0] as { type?: string; rules?: { toolName?: string; ruleContent?: string }[] }
+    if (suggestion.type === 'addRules' && suggestion.rules?.length) {
+      const descriptions = suggestion.rules.map(r => {
+        const cmd = r.ruleContent?.split(':')[0] ?? r.ruleContent
+        return cmd
+      })
+      return t('claude.yesDontAskAgainForCommands', { commands: descriptions.join(' and ') })
+    }
+    return t('claude.yesDontAskAgain')
+  }, [pendingPermission, t])
+
+  const PERMISSION_OPTION_COUNT = showDontAskAgain ? 4 : 3
 
   const handlePermissionSelect = useCallback((index?: number) => {
     if (!pendingPermission) return
     const choice = index ?? permissionFocus
-    if (choice === 0) {
-      // Yes — allow once
+    // Map index to action based on whether "don't ask again" is shown
+    // With don't-ask-again:    0=Yes, 1=Don't ask again, 2=No, 3=Custom
+    // Without don't-ask-again: 0=Yes, 1=No, 2=Custom
+    const action = showDontAskAgain
+      ? (['yes', 'dontAskAgain', 'no', 'custom'] as const)[choice]
+      : (['yes', 'no', 'custom'] as const)[choice]
+
+    if (action === 'yes') {
       window.electronAPI.claude.resolvePermission(sessionId, pendingPermission.toolUseId, {
         behavior: 'allow',
         updatedInput: pendingPermission.input,
       })
       setPendingPermission(null)
-    } else if (choice === 1) {
-      // Yes, always for this session
-      window.electronAPI.claude.resolvePermission(sessionId, pendingPermission.toolUseId, {
-        behavior: 'allow',
-        updatedInput: pendingPermission.input,
-      })
+    } else if (action === 'dontAskAgain') {
+      if (pendingPermission.toolName === 'ExitPlanMode') {
+        window.electronAPI.claude.resolvePermission(sessionId, pendingPermission.toolUseId, {
+          behavior: 'allow',
+          updatedInput: pendingPermission.input,
+          dontAskAgain: true,
+        })
+      } else {
+        window.electronAPI.claude.resolvePermission(sessionId, pendingPermission.toolUseId, {
+          behavior: 'allow',
+          updatedInput: pendingPermission.input,
+          updatedPermissions: pendingPermission.suggestions,
+        })
+      }
       setPendingPermission(null)
-    } else if (choice === 2) {
-      // No — use the same message as VS Code CLI
+    } else if (action === 'no') {
       const toolId = pendingPermission.toolUseId
       setMessages(prev => prev.map(m => {
         if ('toolName' in m && m.id === toolId) {
@@ -1031,11 +1175,9 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         message: "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.",
       })
       setPendingPermission(null)
-    } else if (choice === 3) {
-      // Custom text — deny with reason message
+    } else if (action === 'custom') {
       const msg = permissionCustomText.trim()
       if (!msg) return // don't submit empty
-      // Update the tool call in messages to show the deny reason
       const toolId = pendingPermission.toolUseId
       setMessages(prev => prev.map(m => {
         if ('toolName' in m && m.id === toolId) {
@@ -1050,7 +1192,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       setPendingPermission(null)
       setPermissionCustomText('')
     }
-  }, [sessionId, pendingPermission, permissionFocus, permissionCustomText])
+  }, [sessionId, pendingPermission, permissionFocus, permissionCustomText, showDontAskAgain])
 
   // Read plan file content when ExitPlanMode permission appears
   useEffect(() => {
@@ -1107,6 +1249,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         if (showPromptHistory) {
           e.preventDefault()
           setShowPromptHistory(false)
+          return
+        }
+        if (taskModal) {
+          e.preventDefault()
+          setTaskModal(null)
           return
         }
         if (contentModal) {
@@ -1186,7 +1333,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     }
     window.addEventListener('keydown', handleGlobalKeyDown)
     return () => window.removeEventListener('keydown', handleGlobalKeyDown)
-  }, [isActive, isStreaming, handleStop, pendingPermission, permissionFocus, handlePermissionSelect, showResumeList, showModelList, contentModal, showFilePicker, filePickerPreview])
+  }, [isActive, isStreaming, handleStop, pendingPermission, permissionFocus, handlePermissionSelect, showResumeList, showModelList, taskModal, contentModal, showFilePicker, filePickerPreview])
 
   const handleAskUserSubmit = useCallback(() => {
     if (!pendingQuestion) return
@@ -1395,7 +1542,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             <div className={`tl-dot ${item.status === 'running' ? 'dot-running' : 'dot-success'}`} />
             <div className="tl-content">
               <div className="claude-tool-header" onClick={() => toggleTool(item.id)}>
-                <span className="claude-tool-name">Checklist</span>
+                <span className="claude-tool-name">{t('claude.checklist')}</span>
               </div>
               {renderTodoChecklist(item.input)}
             </div>
@@ -1432,14 +1579,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               )}
               {resultErrors.length > 0 && resultErrors.map((err, i) => (
                 <div key={`err${i}`} className="claude-tool-blocks"><div className="claude-tool-row claude-tool-error-row">
-                  <span className="claude-tool-row-label claude-error-label">ERR</span>
+                  <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
                   <span className="claude-tool-row-content">{err}</span>
                 </div></div>
               ))}
               {resultText && (
                 <div className="claude-tool-blocks">
                   <div className="claude-tool-row">
-                    <span className="claude-tool-row-label">OUT</span>
+                    <span className="claude-tool-row-label">{t('claude.out')}</span>
                     <span className="claude-tool-row-content"><LinkedText text={resultText} /></span>
                   </div>
                 </div>
@@ -1447,7 +1594,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {expandedTools.has(item.id) && (
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
-                    <div className="claude-tool-label">Full Input</div>
+                    <div className="claude-tool-label">{t('claude.fullInput')}</div>
                     <pre>{JSON.stringify(item.input, null, 2)}</pre>
                   </div>
                 </div>
@@ -1489,12 +1636,19 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                 {item.status === 'running' && item.timestamp > 0 && (
                   <span className="claude-task-tag claude-task-elapsed">{formatElapsed(item.timestamp)}</span>
                 )}
+                <button className="claude-subagent-log-btn" onClick={(e) => {
+                  e.stopPropagation()
+                  const taskLabel = item.input.description
+                    ? String(item.input.description).slice(0, 60)
+                    : item.input.subagent_type ? String(item.input.subagent_type) : 'Task'
+                  setTaskModal({ taskId: item.id, label: taskLabel, subagentType: item.input.subagent_type ? String(item.input.subagent_type) : undefined })
+                }}>{t('claude.log')}</button>
                 {item.timestamp > 0 && <span className="claude-tool-time" title={formatFullTimestamp(item.timestamp)}>{formatTimestamp(item.timestamp)}</span>}
               </div>
               {item.status === 'running' && progressDesc && (
                 <div className={`claude-task-progress ${isStalled ? 'stalled' : ''}`}>
                   <span className="claude-task-progress-text">{progressLabel}</span>
-                  {isStalled && <span className="claude-task-stall-warn">Agent may be stalled</span>}
+                  {isStalled && <span className="claude-task-stall-warn">{t('claude.agentMayBeStalled')}</span>}
                 </div>
               )}
               {item.status === 'running' && (
@@ -1502,19 +1656,19 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                   <button className="claude-task-stop-btn" onClick={(e) => {
                     e.stopPropagation()
                     window.electronAPI.claude.stopTask(sessionId, item.id)
-                  }}>Stop</button>
+                  }}>{t('claude.stop')}</button>
                 </div>
               )}
               {(model || maxTurns || runBg) && (
                 <div className="claude-task-meta">
                   {model && <span className="claude-task-tag">model: {model}</span>}
                   {maxTurns && <span className="claude-task-tag">max_turns: {maxTurns}</span>}
-                  {runBg && <span className="claude-task-tag">background</span>}
+                  {runBg && <span className="claude-task-tag">{t('claude.background')}</span>}
                 </div>
               )}
               <div className="claude-task-prompt">
                 <div className="claude-task-section-header" onClick={() => toggleTool(`task-prompt-${item.id}`)}>
-                  <span className="claude-task-section-label">PROMPT</span>
+                  <span className="claude-task-section-label">{t('claude.prompt')}</span>
                   <span className={`claude-tool-chevron ${isPromptExpanded ? 'expanded' : ''}`}>&#9654;</span>
                 </div>
                 <pre className="claude-task-prompt-text">{isPromptExpanded || !isLongPrompt ? prompt : truncatedPrompt}</pre>
@@ -1526,14 +1680,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               </div>
               {resultErrors.length > 0 && resultErrors.map((err, i) => (
                 <div key={`err${i}`} className="claude-tool-blocks"><div className="claude-tool-row claude-tool-error-row">
-                  <span className="claude-tool-row-label claude-error-label">ERR</span>
+                  <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
                   <span className="claude-tool-row-content">{err}</span>
                 </div></div>
               ))}
               {resultText && (
                 <div className="claude-task-result">
                   <div className="claude-task-section-header" onClick={() => toggleTool(`task-result-${item.id}`)}>
-                    <span className="claude-task-section-label">RESULT</span>
+                    <span className="claude-task-section-label">{t('claude.result')}</span>
                     <span className={`claude-tool-chevron ${isResultExpanded ? 'expanded' : ''}`}>&#9654;</span>
                   </div>
                   {isResultExpanded && (
@@ -1549,7 +1703,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {resultReminders.length > 0 && (
                 <div className="claude-task-result">
                   <div className="claude-task-section-header claude-system-reminder-row" onClick={() => toggleTool(`reminder-${item.id}`)}>
-                    <span className="claude-task-section-label claude-reminder-label">SYS</span>
+                    <span className="claude-task-section-label claude-reminder-label">{t('claude.sys')}</span>
                     <span className={`claude-tool-chevron ${expandedTools.has(`reminder-${item.id}`) ? 'expanded' : ''}`}>&#9654;</span>
                   </div>
                   {expandedTools.has(`reminder-${item.id}`) && (
@@ -1560,7 +1714,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {expandedTools.has(item.id) && (
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
-                    <div className="claude-tool-label">Full Input</div>
+                    <div className="claude-tool-label">{t('claude.fullInput')}</div>
                     <pre>{JSON.stringify(item.input, null, 2)}</pre>
                   </div>
                 </div>
@@ -1612,14 +1766,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               </div>
               {resultErrors.length > 0 && resultErrors.map((err, i) => (
                 <div key={`err${i}`} className="claude-tool-blocks"><div className="claude-tool-row claude-tool-error-row">
-                  <span className="claude-tool-row-label claude-error-label">ERR</span>
+                  <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
                   <span className="claude-tool-row-content">{err}</span>
                 </div></div>
               ))}
               {resultText && (
                 <div className="claude-tool-blocks">
                   <div className="claude-tool-row">
-                    <span className="claude-tool-row-label">OUT</span>
+                    <span className="claude-tool-row-label">{t('claude.out')}</span>
                     <span className="claude-tool-row-content"><LinkedText text={resultText} /></span>
                   </div>
                 </div>
@@ -1627,7 +1781,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {expandedTools.has(item.id) && (
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
-                    <div className="claude-tool-label">Full Input</div>
+                    <div className="claude-tool-label">{t('claude.fullInput')}</div>
                     <pre>{JSON.stringify(item.input, null, 2)}</pre>
                   </div>
                 </div>
@@ -1670,14 +1824,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               </div>
               {resultErrors.length > 0 && resultErrors.map((err, i) => (
                 <div key={`err${i}`} className="claude-tool-blocks"><div className="claude-tool-row claude-tool-error-row">
-                  <span className="claude-tool-row-label claude-error-label">ERR</span>
+                  <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
                   <span className="claude-tool-row-content">{err}</span>
                 </div></div>
               ))}
               {resultText && (
                 <div className="claude-tool-blocks">
                   <div className="claude-tool-row">
-                    <span className="claude-tool-row-label">OUT</span>
+                    <span className="claude-tool-row-label">{t('claude.out')}</span>
                     <span className="claude-tool-row-content"><LinkedText text={resultText} /></span>
                   </div>
                 </div>
@@ -1685,7 +1839,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {expandedTools.has(item.id) && (
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
-                    <div className="claude-tool-label">Full Input</div>
+                    <div className="claude-tool-label">{t('claude.fullInput')}</div>
                     <pre>{JSON.stringify(item.input, null, 2)}</pre>
                   </div>
                 </div>
@@ -1731,14 +1885,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               </div>
               {resultErrors.length > 0 && resultErrors.map((err, i) => (
                 <div key={`err${i}`} className="claude-tool-blocks"><div className="claude-tool-row claude-tool-error-row">
-                  <span className="claude-tool-row-label claude-error-label">ERR</span>
+                  <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
                   <span className="claude-tool-row-content">{err}</span>
                 </div></div>
               ))}
               {resultText && (
                 <div className="claude-task-result">
                   <div className="claude-task-section-header" onClick={() => toggleTool(`taskout-result-${item.id}`)}>
-                    <span className="claude-task-section-label">RESULT</span>
+                    <span className="claude-task-section-label">{t('claude.result')}</span>
                     <span className={`claude-tool-chevron ${isResultExpanded ? 'expanded' : ''}`}>&#9654;</span>
                   </div>
                   {(isResultExpanded || !isLongResult) && (
@@ -1754,7 +1908,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {expandedTools.has(item.id) && (
                 <div className="claude-tool-body">
                   <div className="claude-tool-input">
-                    <div className="claude-tool-label">Full Input</div>
+                    <div className="claude-tool-label">{t('claude.fullInput')}</div>
                     <pre>{JSON.stringify(item.input, null, 2)}</pre>
                   </div>
                 </div>
@@ -1787,7 +1941,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <div
                 className="claude-tool-row"
                 onClick={() => handleCopyBlock(inContent, inBlockId)}
-                title="Click to copy"
+                title={t('claude.clickToCopy')}
               >
                 <span className="claude-tool-row-label">IN</span>
                 <span className="claude-tool-row-content">
@@ -1812,7 +1966,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                   <>
                     {errors.length > 0 && errors.map((err, i) => (
                       <div key={`err${i}`} className="claude-tool-row claude-tool-error-row">
-                        <span className="claude-tool-row-label claude-error-label">ERR</span>
+                        <span className="claude-tool-row-label claude-error-label">{t('claude.err')}</span>
                         <span className="claude-tool-row-content">{err}</span>
                       </div>
                     ))}
@@ -1820,9 +1974,9 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                       <div
                         className="claude-tool-row"
                         onClick={() => handleCopyBlock(outText, outBlockId)}
-                        title="Click to copy"
+                        title={t('claude.clickToCopy')}
                       >
-                        <span className="claude-tool-row-label">OUT</span>
+                        <span className="claude-tool-row-label">{t('claude.out')}</span>
                         <span className="claude-tool-row-content"><LinkedText text={outText} /></span>
                         <span className={`claude-tool-row-copy ${copiedId === outBlockId ? 'copied' : ''}`}>
                           {copiedId === outBlockId ? '✓' : '⧉'}
@@ -1834,7 +1988,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                         className="claude-tool-row claude-system-reminder-row"
                         onClick={() => toggleTool(`reminder-${item.id}`)}
                       >
-                        <span className="claude-tool-row-label claude-reminder-label">SYS</span>
+                        <span className="claude-tool-row-label claude-reminder-label">{t('claude.sys')}</span>
                         <span className="claude-tool-row-content">
                           {expandedTools.has(`reminder-${item.id}`)
                             ? reminders.join('\n\n')
@@ -1849,7 +2003,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               })()}
             </div>
             {item.denied && (
-              <div className="claude-tool-interrupted">Tool interrupted</div>
+              <div className="claude-tool-interrupted">{t('claude.toolInterrupted')}</div>
             )}
             {expandedTools.has(item.id) && (
               <div className="claude-tool-body">
@@ -1917,7 +2071,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                   }}
                 >
                   <span className={`claude-tool-chevron ${isExpanded ? 'expanded' : ''}`}>&#9654;</span>
-                  <span className="claude-thinking-label">Thinking</span>
+                  <span className="claude-thinking-label">{t('claude.thinking')}</span>
                 </div>
                 {isExpanded && (
                   <pre className="claude-thinking-content">{msg.thinking}</pre>
@@ -1966,17 +2120,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <div
                 key={task.id}
                 className="claude-active-task-item"
-                onClick={() => {
-                  const el = document.querySelector(`[data-tool-id="${task.id}"]`)
-                  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-                }}
+                onClick={() => setTaskModal({ taskId: task.id, label, subagentType: task.input.subagent_type ? String(task.input.subagent_type) : undefined })}
               >
                 <span className="claude-active-task-dot" />
                 <span className="claude-active-task-label">{label}</span>
                 {progressDesc && !isStalled && <span className="claude-active-task-progress">{progressDesc}</span>}
-                {isStalled && <span className="claude-active-task-stalled">stalled</span>}
+                {isStalled && <span className="claude-active-task-stalled">{t('claude.stalled')}</span>}
                 <span className="claude-active-task-time">{formatElapsed(task.timestamp)}</span>
-                {task.input.run_in_background && <span className="claude-task-tag">bg</span>}
+                {task.input.run_in_background && <span className="claude-task-tag">{t('claude.bg')}</span>}
                 <button className="claude-task-stop-btn" onClick={(e) => {
                   e.stopPropagation()
                   window.electronAPI.claude.stopTask(sessionId, task.id)
@@ -1994,7 +2145,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               onClick={loadMoreArchived}
               disabled={isLoadingMore}
             >
-              {isLoadingMore ? 'Loading...' : `Load older messages (${archivedCountRef.current - loadedFromArchiveRef.current} archived)`}
+              {isLoadingMore ? t('common.loading') : t('claude.loadOlderMessages', { count: archivedCountRef.current - loadedFromArchiveRef.current })}
             </button>
           </div>
         )}
@@ -2010,7 +2161,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
           <div className="tl-item">
             <div className="tl-dot dot-thinking" />
             <div className="tl-content claude-thinking">
-              <span className="claude-thinking-text">Thinking</span>
+              <span className="claude-thinking-text">{t('claude.thinking')}</span>
               <span className="claude-thinking-dots"><span>.</span><span>.</span><span>.</span></span>
             </div>
           </div>
@@ -2024,7 +2175,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                 onClick={() => setShowThinking(prev => !prev)}
               >
                 <span className={`claude-tool-chevron ${showThinking ? 'expanded' : ''}`}>&#9654;</span>
-                <span className="claude-thinking-label">Thinking{isStreaming && streamingThinking && !streamingText ? '...' : ''}</span>
+                <span className="claude-thinking-label">{t('claude.thinking')}{isStreaming && streamingThinking && !streamingText ? '...' : ''}</span>
               </div>
               {showThinking && (
                 <pre ref={streamingThinkingRef} className="claude-thinking-content">{streamingThinking}</pre>
@@ -2042,7 +2193,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         )}
         <div ref={messagesEndRef} />
         {userScrolledUp && (
-          <button className="scroll-to-bottom-btn" onClick={scrollToBottom} title="Scroll to bottom">
+          <button className="scroll-to-bottom-btn" onClick={scrollToBottom} title={t('claude.scrollToBottom')}>
             &#x2193;
           </button>
         )}
@@ -2061,9 +2212,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             : 'safe'
           }`}
         >
-          <div className="claude-permission-title">
-            Allow this <strong>{pendingPermission.toolName}</strong> call?
-          </div>
+          <div className="claude-permission-title" dangerouslySetInnerHTML={{ __html: t('claude.allowThisCall', { toolName: pendingPermission.toolName }) }} />
           <div className="claude-permission-command">
             {toolInputSummary(pendingPermission.toolName, pendingPermission.input)}
           </div>
@@ -2071,7 +2220,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             <div className="claude-plan-block">
               <pre className="claude-plan-content">{planContent.split('\n').slice(0, 3).join('\n')}{planContent.split('\n').length > 3 ? '\n...' : ''}</pre>
               <div className="claude-plan-open-btn" onClick={() => setContentModal({ title: 'Plan', content: planContent })}>
-                View full plan ({planContent.split('\n').length} lines)
+                {t('claude.viewFullPlan', { count: planContent.split('\n').length })}
               </div>
             </div>
           )}
@@ -2092,41 +2241,43 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               onMouseEnter={() => setPermissionFocus(0)}
             >
               <span className="claude-permission-option-num">1</span>
-              <span className="claude-permission-option-label">Yes</span>
+              <span className="claude-permission-option-label">{t('claude.yes')}</span>
             </div>
+            {showDontAskAgain && (
+              <div
+                className={`claude-permission-option ${permissionFocus === 1 ? 'focused' : ''}`}
+                onClick={() => handlePermissionSelect(1)}
+                onMouseEnter={() => setPermissionFocus(1)}
+              >
+                <span className="claude-permission-option-num">2</span>
+                <span className="claude-permission-option-label">{dontAskAgainLabel}</span>
+              </div>
+            )}
             <div
-              className={`claude-permission-option ${permissionFocus === 1 ? 'focused' : ''}`}
-              onClick={() => handlePermissionSelect(1)}
-              onMouseEnter={() => setPermissionFocus(1)}
+              className={`claude-permission-option ${permissionFocus === (showDontAskAgain ? 2 : 1) ? 'focused' : ''}`}
+              onClick={() => handlePermissionSelect(showDontAskAgain ? 2 : 1)}
+              onMouseEnter={() => setPermissionFocus(showDontAskAgain ? 2 : 1)}
             >
-              <span className="claude-permission-option-num">2</span>
-              <span className="claude-permission-option-label">Yes, don't ask again for this session</span>
+              <span className="claude-permission-option-num">{showDontAskAgain ? 3 : 2}</span>
+              <span className="claude-permission-option-label">{t('claude.no')}</span>
             </div>
             <div
-              className={`claude-permission-option ${permissionFocus === 2 ? 'focused' : ''}`}
-              onClick={() => handlePermissionSelect(2)}
-              onMouseEnter={() => setPermissionFocus(2)}
-            >
-              <span className="claude-permission-option-num">3</span>
-              <span className="claude-permission-option-label">No</span>
-            </div>
-            <div
-              className={`claude-permission-option custom ${permissionFocus === 3 ? 'focused' : ''}`}
-              onClick={() => { setPermissionFocus(3); permissionCustomRef.current?.focus() }}
-              onMouseEnter={() => setPermissionFocus(3)}
+              className={`claude-permission-option custom ${permissionFocus === (showDontAskAgain ? 3 : 2) ? 'focused' : ''}`}
+              onClick={() => { setPermissionFocus(showDontAskAgain ? 3 : 2); permissionCustomRef.current?.focus() }}
+              onMouseEnter={() => setPermissionFocus(showDontAskAgain ? 3 : 2)}
             >
               <input
                 ref={permissionCustomRef}
                 className="claude-permission-custom-input"
                 type="text"
-                placeholder="Tell Claude what to do instead"
+                placeholder={t('claude.tellClaudeInstead')}
                 value={permissionCustomText}
                 onChange={e => setPermissionCustomText(e.target.value)}
                 onFocus={() => setPermissionFocus(3)}
               />
             </div>
           </div>
-          <div className="claude-permission-hint">Esc to cancel</div>
+          <div className="claude-permission-hint">{t('claude.escToCancel')}</div>
         </div>
         )
       })()}
@@ -2160,7 +2311,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                   <div className="claude-ask-other">
                     <input
                       type="text"
-                      placeholder="Other..."
+                      placeholder={t('claude.other')}
                       value={askOtherText[String(qi)] || ''}
                       onChange={e => setAskOtherText(prev => ({ ...prev, [String(qi)]: e.target.value }))}
                     />
@@ -2172,7 +2323,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                       sandbox="allow-same-origin"
                       srcDoc={selectedPreview}
                       style={{ width: '100%', border: 'none', minHeight: 120, background: 'var(--bg-primary)' }}
-                      title="Option preview"
+                      title={t('claude.optionPreview')}
                     />
                   </div>
                 )}
@@ -2180,7 +2331,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             )
           })}
           <div className="claude-ask-actions">
-            <button className="claude-permission-btn allow" onClick={handleAskUserSubmit}>Submit</button>
+            <button className="claude-permission-btn allow" onClick={handleAskUserSubmit}>{t('claude.submit')}</button>
           </div>
         </div>
       )}
@@ -2188,7 +2339,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       {/* Resume Session List */}
       {showResumeList && (
         <div className="claude-resume-card">
-          <div className="claude-permission-title">Resume a previous session</div>
+          <div className="claude-permission-title">{t('claude.resumeSession')}</div>
           {resumeLoading ? (
             <div className="claude-resume-empty">Loading sessions...</div>
           ) : resumeSessions.length === 0 ? (
@@ -2214,7 +2365,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               ))}
             </div>
           )}
-          <div className="claude-permission-hint">Esc to cancel</div>
+          <div className="claude-permission-hint">{t('claude.escToCancel')}</div>
         </div>
       )}
 
@@ -2240,7 +2391,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               ))}
             </div>
           )}
-          <div className="claude-permission-hint">Esc to cancel</div>
+          <div className="claude-permission-hint">{t('claude.escToCancel')}</div>
         </div>
       )}
 
@@ -2365,7 +2516,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                 <button
                   className="claude-attachment-remove"
                   onClick={() => removeImage(img.path)}
-                  title="Remove image"
+                  title={t('claude.removeImage')}
                 >
                   &times;
                 </button>
@@ -2375,7 +2526,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <button
                 className="claude-add-image-btn"
                 onClick={handleSelectImages}
-                title="Add image"
+                title={t('claude.addImage')}
               >
                 +
               </button>
@@ -2384,11 +2535,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         )}
         <div className="claude-input-footer">
           <div className="claude-input-controls">
-            {gitBranch && (
-              <span className="claude-status-btn claude-statusline-branch" title={`Branch: ${gitBranch}`}>
-                [{gitBranch}]
-              </span>
-            )}
             <span
               className={`claude-status-btn claude-mode-${permissionMode}`}
               onClick={handlePermissionModeCycle}
@@ -2410,20 +2556,13 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               className="claude-effort-select"
               value={effortLevel}
               onChange={handleEffortChange}
-              title="Effort level"
+              title={t('claude.effortLevel')}
             >
               <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high">high</option>
               <option value="max">max</option>
             </select>
-            <span
-              className={`claude-status-btn claude-1m-toggle${enable1MContext ? ' active' : ''}`}
-              onClick={handle1MContextToggle}
-              title="1M context window (Sonnet only)"
-            >
-              1M
-            </span>
             {accountInfo?.organization && (
               <span className="claude-status-btn claude-account-info" title={`${accountInfo.email || ''} (${accountInfo.subscriptionType || 'unknown'})`}>
                 {accountInfo.organization}
@@ -2436,15 +2575,15 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <button
                 className="claude-fork-btn"
                 onClick={handleForkSession}
-                title="Fork: create a new tab from current conversation"
+                title={t('claude.forkSession')}
               >
-                用目前進度分支 <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" style={{verticalAlign: '-1px', marginLeft: '2px'}}><circle cx="5" cy="3" r="1.5"/><circle cx="11" cy="3" r="1.5"/><circle cx="5" cy="13" r="1.5"/><path d="M5 4.5V11.5M5 7C5 7 5 5 8 5S11 4.5 11 4.5" fill="none" stroke="currentColor" strokeWidth="1.5"/></svg>
+                {t('claude.forkButton')} <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" style={{verticalAlign: '-1px', marginLeft: '2px'}}><circle cx="5" cy="3" r="1.5"/><circle cx="11" cy="3" r="1.5"/><circle cx="5" cy="13" r="1.5"/><path d="M5 4.5V11.5M5 7C5 7 5 5 8 5S11 4.5 11 4.5" fill="none" stroke="currentColor" strokeWidth="1.5"/></svg>
               </button>
             )}
             <span
               className="claude-status-btn"
               onClick={handleSelectImages}
-              title="Attach images (max 5)"
+              title={t('claude.attachImages')}
             >
               &#128206;
             </span>
@@ -2452,7 +2591,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <button
                 className="claude-send-btn claude-stop-btn"
                 onClick={handleStop}
-                title="Stop (Esc)"
+                title={t('claude.stopEsc')}
               >
                 ■
               </button>
@@ -2461,7 +2600,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                 className="claude-send-btn"
                 onClick={handleSend}
                 disabled={false}
-                title="Send message"
+                title={t('claude.sendMessage')}
               >
                 ▶
               </button>
@@ -2484,6 +2623,73 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         </div>
       )}
 
+      {/* Subagent Modal */}
+      {taskModal && (() => {
+        const taskMsgs = subagentMessagesRef.current.get(taskModal.taskId) || []
+        const streamText = subagentStreamingText.get(taskModal.taskId) || ''
+        const streamThink = subagentStreamingThinking.get(taskModal.taskId) || ''
+        const parentTask = allMessages.find(m => isToolCall(m) && m.id === taskModal.taskId) as ClaudeToolCall | undefined
+        const isRunning = parentTask?.status === 'running'
+        // Force re-render dependency
+        void taskModalTick
+
+        return (
+          <div className="claude-plan-overlay" onClick={() => setTaskModal(null)}>
+            <div className="claude-plan-modal claude-subagent-modal" onClick={e => e.stopPropagation()}>
+              <div className="claude-plan-modal-header">
+                {isRunning && <span className="claude-active-task-dot" />}
+                <span className="claude-tool-name" style={{ marginRight: 4 }}>Task</span>
+                {taskModal.subagentType && <span className="claude-tool-badge" style={{ marginRight: 6 }}>{taskModal.subagentType}</span>}
+                <span className="claude-plan-modal-title">{taskModal.label}</span>
+                <span className="claude-subagent-meta">
+                  {taskMsgs.length} messages
+                  {parentTask && parentTask.timestamp > 0 ? ` · ${formatElapsed(parentTask.timestamp)}` : ''}
+                </span>
+                <button className="claude-plan-modal-close" onClick={() => setTaskModal(null)}>&times;</button>
+              </div>
+              <div className="claude-subagent-body" ref={el => {
+                if (!el) return
+                const body = el
+                // Auto-scroll to bottom when content updates
+                const isNearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80
+                if (isNearBottom) {
+                  requestAnimationFrame(() => { body.scrollTop = body.scrollHeight })
+                }
+              }}>
+                <div className="claude-messages claude-timeline">
+                  {taskMsgs.map((item, i) => renderMessage(item, i))}
+                  {isRunning && streamThink && (
+                    <div className="tl-item">
+                      <div className="tl-dot dot-thinking" />
+                      <div className="tl-content">
+                        <pre className="claude-thinking-block">{streamThink}</pre>
+                      </div>
+                    </div>
+                  )}
+                  {isRunning && streamText && (
+                    <div className="tl-item">
+                      <div className="tl-dot dot-running" />
+                      <div className="tl-content">
+                        <div className="claude-assistant-text"><LinkedText text={streamText} /></div>
+                      </div>
+                    </div>
+                  )}
+                  {isRunning && !streamText && !streamThink && taskMsgs.length === 0 && (
+                    <div className="tl-item">
+                      <div className="tl-dot dot-thinking" />
+                      <div className="tl-content claude-thinking">
+                        <span className="claude-thinking-text">{t('claude.thinking')}</span>
+                        <span className="claude-thinking-dots"><span>.</span><span>.</span><span>.</span></span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Prompt History Modal */}
       {showPromptHistory && (() => {
         const userPrompts = allMessages
@@ -2499,7 +2705,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                     const text = userPrompts.map((m, i) => `--- Prompt ${i + 1} ---\n${m.content}`).join('\n\n')
                     navigator.clipboard.writeText(text)
                   }}
-                  title="Copy all prompts"
+                  title={t('claude.copyAllPrompts')}
                 >copy all</button>
                 <button className="claude-plan-modal-close" onClick={() => setShowPromptHistory(false)}>&times;</button>
               </div>
@@ -2514,7 +2720,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                       <button
                         className="claude-prompt-history-copy-one"
                         onClick={() => navigator.clipboard.writeText(m.content)}
-                        title="Copy this prompt"
+                        title={t('claude.copyThisPrompt')}
                       >copy</button>
                     </div>
                     <pre className="claude-prompt-history-content">{m.content}</pre>
@@ -2526,91 +2732,111 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         )
       })()}
 
-      {/* Status line */}
-      <div className="claude-statuslines">
-        <div className="claude-statusline">
-          {/* Session info group */}
-          <span
-            className="claude-statusline-item claude-statusline-clickable"
-            onClick={async () => {
-              setResumeLoading(true)
-              setShowResumeList(true)
-              try {
-                const sessions = await window.electronAPI.claude.listSessions(cwd)
-                setResumeSessions(sessions || [])
-              } catch {
-                setResumeSessions([])
-              } finally {
-                setResumeLoading(false)
-              }
-            }}
-            title={sessionMeta?.sdkSessionId
-              ? `SDK Session: ${sessionMeta.sdkSessionId}\nPanel: ${sessionId}\nClick to resume a session`
-              : `Panel: ${sessionId}\nClick to resume a session`
-            }
-          >
-            {sessionMeta?.sdkSessionId
-              ? sessionMeta.sdkSessionId.slice(0, 8)
-              : sessionId.slice(0, 8)
-            }
-          </span>
-          {sessionMeta && (
-            <span className="claude-statusline-item" title={`in: ${sessionMeta.inputTokens.toLocaleString()} / out: ${sessionMeta.outputTokens.toLocaleString()}`}>
+      {/* Status line — always visible, visually attached to input-area when present */}
+      {(() => {
+        const fmtRemaining = (d: Date) => {
+          const ms = d.getTime() - Date.now()
+          if (ms <= 0) return '0m'
+          const h = Math.floor(ms / 3600000)
+          const m = Math.floor((ms % 3600000) / 60000)
+          return h > 24 ? `${Math.floor(h / 24)}d${h % 24}h` : h > 0 ? `${h}h${m}m` : `${m}m`
+        }
+
+        const renderers: Record<string, () => React.ReactNode | null> = {
+          sessionId: () => (
+            <span key="sessionId" className="claude-statusline-item claude-statusline-clickable"
+              onClick={async () => {
+                setResumeLoading(true); setShowResumeList(true)
+                try { setResumeSessions(await window.electronAPI.claude.listSessions(cwd) || []) }
+                catch { setResumeSessions([]) }
+                finally { setResumeLoading(false) }
+              }}
+              title={sessionMeta?.sdkSessionId
+                ? `SDK Session: ${sessionMeta.sdkSessionId}\nPanel: ${sessionId}\nClick to resume`
+                : `Panel: ${sessionId}\nClick to resume`}
+            >
+              {sessionMeta?.sdkSessionId ? sessionMeta.sdkSessionId.slice(0, 8) : sessionId.slice(0, 8)}
+            </span>
+          ),
+          gitBranch: () => !gitBranch ? null : (
+            <span key="gitBranch" className="claude-statusline-item">[{gitBranch}]</span>
+          ),
+          tokens: () => !sessionMeta ? null : (
+            <span key="tokens" className="claude-statusline-item" title={`in: ${sessionMeta.inputTokens.toLocaleString()} / out: ${sessionMeta.outputTokens.toLocaleString()}`}>
               {(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} tok
             </span>
-          )}
-          {sessionMeta && sessionMeta.numTurns > 0 && (
-            <span className="claude-statusline-item">{sessionMeta.numTurns} turns</span>
-          )}
-          {sessionMeta && sessionMeta.durationMs > 0 && (
-            <span className="claude-statusline-item">{(sessionMeta.durationMs / 1000).toFixed(1)}s</span>
-          )}
-
-          {/* Separator: session | cost */}
-          {sessionMeta && sessionMeta.contextWindow > 0 && <span className="claude-statusline-sep">&middot;</span>}
-
-          {/* Cost & context group */}
-          {sessionMeta && sessionMeta.contextWindow > 0 && (
-            <span className="claude-statusline-item" title={`${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens`}>
+          ),
+          turns: () => !sessionMeta || sessionMeta.numTurns <= 0 ? null : (
+            <span key="turns" className="claude-statusline-item">{sessionMeta.numTurns} turns</span>
+          ),
+          duration: () => !sessionMeta || sessionMeta.durationMs <= 0 ? null : (
+            <span key="duration" className="claude-statusline-item">{(sessionMeta.durationMs / 1000).toFixed(1)}s</span>
+          ),
+          contextPct: () => !sessionMeta || sessionMeta.contextWindow <= 0 ? null : (
+            <span key="contextPct" className="claude-statusline-item" title={`${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens`}>
               ctx {Math.round(((sessionMeta.inputTokens + sessionMeta.outputTokens) / sessionMeta.contextWindow) * 100)}%
             </span>
-          )}
-          {sessionMeta && sessionMeta.totalCost > 0 && (
-            <span className="claude-statusline-item">${sessionMeta.totalCost.toFixed(4)}</span>
-          )}
+          ),
+          cost: () => !sessionMeta || sessionMeta.totalCost <= 0 ? null : (
+            <span key="cost" className="claude-statusline-item">${sessionMeta.totalCost.toFixed(4)}</span>
+          ),
+          workspace: () => {
+            const ws = workspaceId ? workspaceStore.getState().workspaces.find(w => w.id === workspaceId) : null
+            return ws ? <span key="workspace" className="claude-statusline-item">{ws.alias || ws.name}</span> : null
+          },
+          usage5h: () => claudeUsage?.fiveHour == null ? null : (
+            <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ''}`}>
+              5h:{Math.round(claudeUsage.fiveHour)}%
+            </span>
+          ),
+          usage5hReset: () => {
+            if (!claudeUsage?.fiveHourReset) return null
+            return <span key="usage5hReset" className="claude-statusline-item">↻{fmtRemaining(new Date(claudeUsage.fiveHourReset))}</span>
+          },
+          usage7d: () => claudeUsage?.sevenDay == null ? null : (
+            <span key="usage7d" className={`claude-statusline-item${(claudeUsage.sevenDay ?? 0) > 80 ? ' claude-usage-high' : (claudeUsage.sevenDay ?? 0) > 50 ? ' claude-usage-mid' : ''}`}>
+              7d:{Math.round(claudeUsage.sevenDay ?? 0)}%
+            </span>
+          ),
+          usage7dReset: () => {
+            if (!claudeUsage?.sevenDayReset) return null
+            return <span key="usage7dReset" className="claude-statusline-item">↻{fmtRemaining(new Date(claudeUsage.sevenDayReset))}</span>
+          },
+          prompts: () => (
+            <span key="prompts" className="claude-statusline-item claude-statusline-clickable"
+              onClick={() => setShowPromptHistory(true)} title={t('claude.viewPromptHistory')}>{t('claude.prompts')}</span>
+          ),
+        }
 
-          {/* Separator: cost | rate limits */}
-          {claudeUsage && claudeUsage.fiveHour != null && <span className="claude-statusline-sep">&middot;</span>}
-
-          {/* Rate limits group */}
-          {claudeUsage && claudeUsage.fiveHour != null && (() => {
-            const fmtRemaining = (d: Date) => {
-              const ms = d.getTime() - Date.now()
-              if (ms <= 0) return '0m'
-              const h = Math.floor(ms / 3600000)
-              const m = Math.floor((ms % 3600000) / 60000)
-              return h > 24 ? `${Math.floor(h / 24)}d${h % 24}h` : h > 0 ? `${h}h${m}m` : `${m}m`
+        const renderZone = (align: 'left' | 'center' | 'right') => {
+          const items = statuslineConfig.filter(c => c.visible && (c.align || 'left') === align)
+          const nodes: React.ReactNode[] = []
+          for (const item of items) {
+            let node = renderers[item.id]?.()
+            if (!node) continue
+            // Apply color directly on the element via cloneElement to override class-based colors
+            if (item.color && isValidElement(node)) {
+              node = cloneElement(node, { style: { ...(node.props.style || {}), color: item.color } })
             }
-            const fiveReset = claudeUsage.fiveHourReset ? fmtRemaining(new Date(claudeUsage.fiveHourReset)) : null
-            const sevenReset = claudeUsage.sevenDayReset ? fmtRemaining(new Date(claudeUsage.sevenDayReset)) : null
-            return (
-              <span
-                className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ''}`}
-              >
-                5h:{Math.round(claudeUsage.fiveHour)}%{fiveReset ? ` ↻${fiveReset}` : ''} · 7d:{Math.round(claudeUsage.sevenDay ?? 0)}%{sevenReset ? ` ↻${sevenReset}` : ''}
-              </span>
-            )
-          })()}
+            nodes.push(node)
+            if (item.separatorAfter) nodes.push(<span key={`sep-${item.id}`} className="claude-statusline-sep">&middot;</span>)
+          }
+          return nodes
+        }
 
-          {/* Right-aligned prompts link */}
-          <span className="claude-status-spacer" />
-          <span
-            className="claude-statusline-item claude-statusline-clickable"
-            onClick={() => setShowPromptHistory(true)}
-            title="View prompt history"
-          >prompts</span>
-        </div>
-      </div>
+        const hasCenter = statuslineConfig.some(c => c.visible && c.align === 'center')
+        const hasRight = statuslineConfig.some(c => c.visible && c.align === 'right')
+
+        return (
+          <div className={`claude-statusline-bar${!pendingPermission && !pendingQuestion && !showResumeList && !showModelList ? ' attached' : ''}`}>
+            <div className="claude-statusline">
+              <div className="claude-statusline-left">{renderZone('left')}</div>
+              {hasCenter && <div className="claude-statusline-center">{renderZone('center')}</div>}
+              {hasRight && <div className="claude-statusline-right">{renderZone('right')}</div>}
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

@@ -41,25 +41,56 @@ export const TerminalPanel = memo(function TerminalPanel({ terminalId, isActive 
     isActiveRef.current = isActive
   }, [isActive])
 
-  // Handle paste with text size checking
-  const handlePasteText = (text: string) => {
+  const pasteAbortRef = useRef<{ cancelled: boolean } | null>(null)
+
+  // Chunked write with sequential scheduling (avoids creating thousands of timers)
+  const writeChunked = (text: string) => {
+    const CHUNK_SIZE = 2000
+    const DELAY = 30
+    const abort = { cancelled: false }
+    pasteAbortRef.current = abort
+    let offset = 0
+
+    const sendNext = () => {
+      if (abort.cancelled || offset >= text.length) {
+        pasteAbortRef.current = null
+        return
+      }
+      const chunk = text.slice(offset, offset + CHUNK_SIZE)
+      offset += CHUNK_SIZE
+      window.electronAPI.pty.write(terminalId, chunk)
+      setTimeout(sendNext, DELAY)
+    }
+    sendNext()
+  }
+
+  // Handle paste with size confirmation for large text
+  const handlePasteText = async (text: string) => {
     if (!text) return
 
-    // For very long text (> 2000 chars), split into smaller chunks
-    if (text.length > 2000) {
-      const chunks = []
-      for (let i = 0; i < text.length; i += 1000) {
-        chunks.push(text.slice(i, i + 1000))
-      }
+    // Cancel any in-progress paste
+    if (pasteAbortRef.current) {
+      pasteAbortRef.current.cancelled = true
+    }
 
-      // Send chunks with small delays to prevent overwhelming the terminal
-      chunks.forEach((chunk, index) => {
-        setTimeout(() => {
-          window.electronAPI.pty.write(terminalId, chunk)
-        }, index * 50) // 50ms delay between chunks
-      })
+    const CONFIRM_THRESHOLD = 10 * 1024 // 10KB
+
+    if (text.length > CONFIRM_THRESHOLD) {
+      const sizeKB = (text.length / 1024).toFixed(1)
+      const sizeMB = (text.length / (1024 * 1024)).toFixed(2)
+      const sizeLabel = text.length > 1024 * 1024 ? `${sizeMB} MB` : `${sizeKB} KB`
+      const lines = text.split('\n').length
+
+      const confirmed = await window.electronAPI.dialog.confirm(
+        `About to paste a large text:\n\n• Size: ${sizeLabel} (${text.length.toLocaleString()} chars)\n• Lines: ${lines.toLocaleString()}\n\nThis may take a moment. Continue?`,
+        'Large Paste Warning'
+      )
+      if (!confirmed) return
+    }
+
+    if (text.length > 4000) {
+      writeChunked(text)
     } else {
-      // Normal sized text, send directly
       window.electronAPI.pty.write(terminalId, text)
     }
   }
@@ -272,10 +303,27 @@ export const TerminalPanel = memo(function TerminalPanel({ terminalId, isActive 
       }
     })
 
+    // Track IME composition state on xterm's hidden textarea
+    // to prevent CAPS LOCK and other keys from committing partial IME input
+    let imeComposing = false
+    const xtermTextarea = containerRef.current?.querySelector('.xterm-helper-textarea')
+    if (xtermTextarea) {
+      xtermTextarea.addEventListener('compositionstart', () => { imeComposing = true })
+      xtermTextarea.addEventListener('compositionend', () => { imeComposing = false })
+    }
+
     // Handle copy and paste shortcuts
     terminal.attachCustomKeyEventHandler((event) => {
       // Only handle keydown events to prevent duplicate actions
       if (event.type !== 'keydown') return true
+
+      // During IME composition, block non-composition key events
+      // to prevent CAPS LOCK etc. from committing partial input
+      if (imeComposing || event.isComposing) {
+        // keyCode 229 = IME composition event, let it through
+        // Everything else (CAPS LOCK, modifiers, etc.) should be blocked
+        return event.keyCode === 229
+      }
 
       // Shift+Enter for newline (multiline input)
       if (event.shiftKey && event.key === 'Enter') {

@@ -1,7 +1,8 @@
 {
   "name": "better-agent-terminal",
-  "version": "1.52.0",
+  "version": "2.0.2",
   "description": "Windows terminal aggregator with multi-workspace support and Claude Code integration",
+  "author": "TonyQ CO., LTD.",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "cross-env BAT_DEBUG=1 vite",
@@ -9,7 +10,7 @@
     "start": "electron .",
     "build": "vite build && electron-builder",
     "build:release": "node scripts/build-version.js",
-    "postinstall": "echo 'Run electron-rebuild manually if node-pty is needed'",
+    "postinstall": "node -e \"if(process.platform==='darwin'){const p=require('path').join('node_modules/electron/dist/Electron.app/Contents/Info.plist');try{require('child_process').execSync('plutil -replace CFBundleName -string BetterAgentTerminal '+p+' && plutil -replace CFBundleDisplayName -string BetterAgentTerminal '+p)}catch(e){}}\" && echo 'postinstall done'",
     "test:console": "node tests/console-test.js",
     "test:claude-ctrl-o": "node tests/test-claude-ctrl-o.js",
     "diagnose:ctrl-o": "npx electron tests/diagnose-ctrl-o.js",
@@ -19,14 +20,18 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
     "@anthropic-ai/claude-code": "^2.1.49",
+    "@types/qrcode": "^1.5.6",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-unicode11": "^0.8.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/xterm": "^5.5.0",
     "better-sqlite3": "^12.5.0",
     "highlight.js": "^11.11.1",
+    "i18next": "^25.8.18",
+    "qrcode": "^1.5.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-i18next": "^16.5.8",
     "uuid": "^9.0.0",
     "ws": "^8.19.0"
   },
@@ -34,7 +39,7 @@
     "@lydell/node-pty": "^1.1.0"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.0.2",
+
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.0.0",
     "@types/react": "^18.2.0",
@@ -48,12 +53,15 @@
     "electron-builder": "^24.0.0",
     "png-to-ico": "^3.0.1",
     "sharp": "^0.34.5",
-    "to-ico": "^1.1.5",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.0",
     "vite": "^5.0.0",
     "vite-plugin-electron": "^0.28.0",
     "vite-plugin-electron-renderer": "^0.14.5"
+  },
+  "overrides": {
+    "minimatch@3": "3.1.5",
+    "minimatch@5": "5.1.9"
   },
   "build": {
     "appId": "org.tonyq.better-agent-terminal",
@@ -85,7 +93,18 @@
         "arch": "universal"
       },
       "icon": "assets/icon.png",
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "identity": "TonyQ CO., LTD. (8JVDJGLLYR)",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false,
+      "extendInfo": {
+        "NSDocumentsFolderUsageDescription": "BetterAgentTerminal needs access to your Documents folder to open terminals and manage files in your projects.",
+        "NSDesktopFolderUsageDescription": "BetterAgentTerminal needs access to your Desktop folder to open terminals and manage files in your projects.",
+        "NSDownloadsFolderUsageDescription": "BetterAgentTerminal needs access to your Downloads folder to open terminals and manage files in your projects."
+      }
     },
     "linux": {
       "target": "AppImage",

@@ -7,9 +7,9 @@ import type { ClaudeMessage, ClaudeToolCall, ClaudeSessionState } from '../src/t
 import type { Query, PermissionMode, CanUseTool, SlashCommand } from '@anthropic-ai/claude-agent-sdk'
 import { logger } from './logger'
 
-// App-level permission mode extends SDK's PermissionMode with planBypass
-// planBypass = plan mode (read-only exploration) + auto-approve all tool permissions
-type AppPermissionMode = PermissionMode | 'planBypass'
+// App-level permission mode extends SDK's PermissionMode with bypassPlan
+// bypassPlan = plan mode (read-only exploration) + auto-approve all tool permissions
+type AppPermissionMode = PermissionMode | 'bypassPlan'
 import { broadcastHub } from './remote/broadcast-hub'
 
 // Lazy import the SDK (it's an ES module)
@@ -335,18 +335,19 @@ export class ClaudeAgentManager {
           })
         }
 
-        // In planBypass mode, auto-approve all tool calls except ExitPlanMode
+        // In bypassPlan mode, auto-approve all tool calls except ExitPlanMode
         // ExitPlanMode requires user confirmation before switching to bypass execution
-        if (session.permissionMode === 'planBypass') {
+        if (session.permissionMode === 'bypassPlan') {
           if (toolName === 'ExitPlanMode') {
             return new Promise((resolve) => {
               session.pendingPermissions.set(opts.toolUseID, {
                 resolve: (result: unknown) => {
-                  // On approval, switch to bypassPermissions for execution
                   if ((result as { behavior: string }).behavior === 'allow') {
+                    // bypassPlan + Yes → bypassPermissions (user chose bypass path)
                     session.permissionMode = 'bypassPermissions'
                     this.send('claude:modeChange', sessionId, 'bypassPermissions')
                   }
+                  // deny: don't change mode, stay in bypassPlan
                   resolve(result)
                 }
               })
@@ -362,15 +363,38 @@ export class ClaudeAgentManager {
           return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
         }
 
-        // In bypassPermissions mode (e.g. after planBypass → ExitPlanMode approval),
+        // In bypassPermissions mode (e.g. after bypassPlan → ExitPlanMode approval),
         // auto-approve all tool calls without prompting
         if (session.permissionMode === 'bypassPermissions') {
           return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
         }
 
+        // In acceptEdits mode, auto-approve file edit and read-only tools
+        if (session.permissionMode === 'acceptEdits') {
+          const autoApprovedTools = ['Write', 'Edit', 'NotebookEdit', 'Read', 'Glob', 'Grep']
+          if (autoApprovedTools.includes(toolName)) {
+            return { behavior: 'allow', updatedInput: input as Record<string, unknown> }
+          }
+          // All other tools (Bash, Agent, etc.) still require user confirmation
+        }
+
         // For all other tools, send permission request to frontend
         return new Promise((resolve) => {
-          session.pendingPermissions.set(opts.toolUseID, { resolve })
+          const wrappedResolve = toolName === 'ExitPlanMode'
+            ? (result: unknown) => {
+                if ((result as { behavior: string }).behavior === 'allow') {
+                  if ((result as { dontAskAgain?: boolean }).dontAskAgain) {
+                    session.permissionMode = 'acceptEdits'
+                  } else {
+                    session.permissionMode = 'default'
+                  }
+                  this.send('claude:modeChange', sessionId, session.permissionMode)
+                }
+                // deny: don't change mode, stay in plan
+                resolve(result)
+              }
+            : resolve
+          session.pendingPermissions.set(opts.toolUseID, { resolve: wrappedResolve })
           this.send('claude:permission-request', sessionId, {
             toolUseId: opts.toolUseID,
             toolName,
@@ -382,8 +406,8 @@ export class ClaudeAgentManager {
       }
 
       const currentMode = session.permissionMode
-      // Map app-level planBypass to SDK's plan mode
-      const sdkMode: PermissionMode = currentMode === 'planBypass' ? 'plan' : currentMode
+      // Map app-level bypassPlan to SDK's plan mode
+      const sdkMode: PermissionMode = currentMode === 'bypassPlan' ? 'plan' : currentMode
       const queryOptions: Record<string, unknown> = {
         abortController: session.abortController,
         cwd: session.cwd,
@@ -459,7 +483,19 @@ export class ClaudeAgentManager {
         // Debug: log all message types
         const msgSubtype = (message as { subtype?: string }).subtype
         if (message.type !== 'stream_event' && message.type !== 'assistant') {
-          logger.log(`[claude:msg] type=${message.type} subtype=${msgSubtype || ''}`)
+          logger.log(`[claude:msg] type=${message.type} subtype=${msgSubtype || ''} parent_tool_use_id=${(message as { parent_tool_use_id?: string }).parent_tool_use_id || 'none'}`)
+        }
+        if (message.type === 'assistant') {
+          const blocks = (message as { message?: { content?: unknown[] } }).message?.content
+          if (Array.isArray(blocks)) {
+            const toolBlocks = blocks.filter((b: unknown) => (b as { type?: string }).type === 'tool_use')
+            if (toolBlocks.length > 0) {
+              for (const tb of toolBlocks) {
+                const t = tb as { name?: string; id?: string }
+                logger.log(`[claude:tool_use] name=${t.name} id=${t.id?.slice(0, 12)} parent_tool_use_id=${(message as { parent_tool_use_id?: string }).parent_tool_use_id || 'none'}`)
+              }
+            }
+          }
         }
 
         if (message.type === 'system' && message.subtype === 'init') {
@@ -472,10 +508,15 @@ export class ClaudeAgentManager {
           session.metadata.model = initMsg.model
           session.metadata.sdkSessionId = initMsg.session_id
           session.metadata.cwd = initMsg.cwd || session.cwd
-          logger.log(`[claude:status] EMIT sessionId=${sessionId.slice(0, 8)} sdkSessionId=${session.metadata.sdkSessionId?.slice(0, 8)}`)
+          // SDK reports 'plan' for bypassPlan (since we map bypassPlan→plan before sending to SDK).
+          // Only override SDK's value when we detect this specific mismatch to avoid masking other bugs.
+          const reportedMode = (initMsg.permissionMode === 'plan' && session.permissionMode === 'bypassPlan')
+            ? session.permissionMode
+            : (initMsg.permissionMode || 'default')
+          logger.log(`[claude:status] EMIT sessionId=${sessionId.slice(0, 8)} sdkSessionId=${session.metadata.sdkSessionId?.slice(0, 8)} sdkMode=${initMsg.permissionMode} appMode=${session.permissionMode} reported=${reportedMode}`)
           this.send('claude:status', sessionId, {
             ...session.metadata,
-            permissionMode: initMsg.permissionMode || 'default',
+            permissionMode: reportedMode,
           })
 
         }
@@ -500,6 +541,7 @@ export class ClaudeAgentManager {
                   role: 'assistant',
                   content: block.text,
                   thinking: thinkingText,
+                  parentToolUseId: message.parent_tool_use_id,
                   timestamp: Date.now(),
                 })
               }
@@ -511,30 +553,43 @@ export class ClaudeAgentManager {
                   toolName: toolBlock.name,
                   input: toolBlock.input || {},
                   status: 'running',
+                  parentToolUseId: message.parent_tool_use_id,
                   timestamp: Date.now(),
                 })
+                // Track Agent/Task tool calls in activeTasks for stop support
+                // (task_started events may not always be emitted by the SDK)
+                if ((toolBlock.name === 'Agent' || toolBlock.name === 'Task') && !message.parent_tool_use_id) {
+                  const desc = (toolBlock.input as { description?: string }).description || toolBlock.name
+                  session.activeTasks.set(toolBlock.id, {
+                    toolUseId: toolBlock.id,
+                    description: desc,
+                    lastProgressTime: Date.now(),
+                  })
+                  logger.log(`[activeTasks] Registered ${toolBlock.name} tool_use_id=${toolBlock.id.slice(0, 12)} desc=${desc.slice(0, 60)}`)
+                }
                 // Detect plan mode transitions and notify UI
                 if (toolBlock.name === 'EnterPlanMode') {
-                  // Preserve planBypass if already in it; otherwise set to plan
-                  if (session.permissionMode !== 'planBypass') {
+                  // Preserve bypassPlan if already in it; otherwise set to plan
+                  if (session.permissionMode !== 'bypassPlan') {
                     session.permissionMode = 'plan'
                   }
                   this.send('claude:modeChange', sessionId, session.permissionMode)
-                } else if (toolBlock.name === 'ExitPlanMode') {
-                  // In planBypass, mode transition is handled by canUseTool approval flow
-                  if (session.permissionMode !== 'planBypass') {
-                    session.permissionMode = 'default'
-                    this.send('claude:modeChange', sessionId, 'default')
-                  }
                 }
+                // ExitPlanMode mode transition is handled by canUseTool resolve callbacks
               }
               if ('type' in block && block.type === 'tool_result') {
                 const resultBlock = block as { tool_use_id: string; content?: string; is_error?: boolean }
                 const resultContent = typeof resultBlock.content === 'string'
                   ? resultBlock.content
                   : JSON.stringify(resultBlock.content)
-                // If this tool has an active subagent task, keep it as 'running' — task_notification will complete it
-                const hasActiveTask = Array.from(session.activeTasks.values()).some(t => t.toolUseId === resultBlock.tool_use_id)
+                // Check if this is a tracked Agent/Task tool
+                const activeTask = Array.from(session.activeTasks.entries()).find(([, t]) => t.toolUseId === resultBlock.tool_use_id)
+                if (activeTask && resultContent) {
+                  // Agent/Task returned a result — mark as completed and clean up
+                  logger.log(`[activeTasks] Completed ${resultBlock.tool_use_id.slice(0, 12)} is_error=${resultBlock.is_error}`)
+                  session.activeTasks.delete(activeTask[0])
+                }
+                const hasActiveTask = session.activeTasks.has(resultBlock.tool_use_id)
                 this.updateToolCall(sessionId, resultBlock.tool_use_id, {
                   status: hasActiveTask ? 'running' : (resultBlock.is_error ? 'error' : 'completed'),
                   result: resultContent,
@@ -554,8 +609,13 @@ export class ClaudeAgentManager {
                 const resultStr = typeof resultBlock.content === 'string'
                   ? resultBlock.content
                   : JSON.stringify(resultBlock.content)
-                // If this tool has an active subagent task, keep it as 'running' — task_notification will complete it
-                const hasActiveTask = Array.from(session.activeTasks.values()).some(t => t.toolUseId === resultBlock.tool_use_id)
+                // Check if this is a tracked Agent/Task tool completing
+                const activeTask = Array.from(session.activeTasks.entries()).find(([, t]) => t.toolUseId === resultBlock.tool_use_id)
+                if (activeTask && resultStr) {
+                  logger.log(`[activeTasks] Completed (user msg) ${resultBlock.tool_use_id.slice(0, 12)} is_error=${resultBlock.is_error}`)
+                  session.activeTasks.delete(activeTask[0])
+                }
+                const hasActiveTask = session.activeTasks.has(resultBlock.tool_use_id)
                 this.updateToolCall(sessionId, resultBlock.tool_use_id, {
                   status: hasActiveTask ? 'running' : (resultBlock.is_error ? 'error' : 'completed'),
                   result: resultStr?.slice(0, 2000), // Truncate long results
@@ -645,6 +705,8 @@ export class ClaudeAgentManager {
         // Agent progress events (subagent lifecycle) — type is 'system' with task subtypes
         if (message.type === 'system') {
           const subtype = (message as { subtype?: string }).subtype
+          // Log all system subtypes for debugging agent dispatch
+          logger.log(`[claude:system] subtype=${subtype} keys=${Object.keys(message).join(',')}`)
           if (subtype === 'task_started' || subtype === 'task_progress' || subtype === 'task_notification') {
             const agentMsg = message as {
               subtype: string
@@ -835,8 +897,11 @@ export class ClaudeAgentManager {
 
   async stopTask(sessionId: string, toolUseId: string): Promise<boolean> {
     const session = this.sessions.get(sessionId)
-    if (!session?.queryInstance) return false
-    // Find the task_id by tool_use_id
+    if (!session?.queryInstance) {
+      logger.warn(`[stopTask] No queryInstance for session ${sessionId}`)
+      return false
+    }
+    // Find the task_id by tool_use_id from activeTasks map
     let targetTaskId: string | null = null
     let targetTask: ActiveTask | null = null
     for (const [taskId, task] of session.activeTasks) {
@@ -846,16 +911,31 @@ export class ClaudeAgentManager {
         break
       }
     }
-    if (!targetTaskId) return false
+
+    // If no mapping in activeTasks, try using tool_use_id directly as the task_id
+    // (the SDK may accept it, and task_started events may not always be emitted)
+    if (!targetTaskId) {
+      logger.log(`[stopTask] No activeTasks mapping for toolUseId=${toolUseId}, trying toolUseId as task_id`)
+      targetTaskId = toolUseId
+    }
+
     try {
       await session.queryInstance.stopTask(targetTaskId)
+      logger.log(`[stopTask] Successfully stopped task_id=${targetTaskId}`)
       this.updateToolCall(sessionId, toolUseId, {
+        status: 'completed',
         description: `[stopped by user] ${targetTask?.summary || targetTask?.description || ''}`,
       } as Partial<ClaudeToolCall>)
       session.activeTasks.delete(targetTaskId)
       return true
     } catch (e) {
-      logger.warn('stopTask failed:', e)
+      logger.warn(`[stopTask] stopTask(${targetTaskId}) failed:`, e)
+      // Fallback: try interrupt to stop the whole session if stopTask fails
+      logger.log(`[stopTask] Falling back to marking tool as stopped in UI`)
+      this.updateToolCall(sessionId, toolUseId, {
+        status: 'error',
+        description: `[stop failed] ${targetTask?.description || 'Could not stop task'}`,
+      } as Partial<ClaudeToolCall>)
       return false
     }
   }
@@ -888,8 +968,8 @@ export class ClaudeAgentManager {
     session.permissionMode = mode
     if (!session.queryInstance) return true
     try {
-      // Map app-level planBypass to SDK's plan mode
-      const sdkMode: PermissionMode = mode === 'planBypass' ? 'plan' : mode
+      // Map app-level bypassPlan to SDK's plan mode
+      const sdkMode: PermissionMode = mode === 'bypassPlan' ? 'plan' : mode
       await session.queryInstance.setPermissionMode(sdkMode)
       return true
     } catch (e) {
@@ -978,11 +1058,21 @@ export class ClaudeAgentManager {
     return { ...session.metadata, permissionMode: session.permissionMode }
   }
 
-  resolvePermission(sessionId: string, toolUseId: string, result: { behavior: string; updatedInput?: Record<string, unknown>; message?: string }): boolean {
+  resolvePermission(sessionId: string, toolUseId: string, result: { behavior: string; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[]; message?: string; dontAskAgain?: boolean }): boolean {
     const session = this.sessions.get(sessionId)
     if (!session) return false
     const pending = session.pendingPermissions.get(toolUseId)
     if (!pending) return false
+    // Apply setMode directives from updatedPermissions (e.g. "don't ask again" → acceptEdits)
+    if (result.behavior === 'allow' && result.updatedPermissions) {
+      for (const perm of result.updatedPermissions) {
+        const p = perm as { type?: string; mode?: string }
+        if (p.type === 'setMode' && p.mode) {
+          session.permissionMode = p.mode as AppPermissionMode
+          this.send('claude:modeChange', sessionId, session.permissionMode)
+        }
+      }
+    }
     pending.resolve(result)
     session.pendingPermissions.delete(toolUseId)
     return true
@@ -1227,6 +1317,7 @@ export class ClaudeAgentManager {
               role: 'assistant' as const,
               content: cleanedAssistantText || '',
               ...(thinkingText ? { thinking: thinkingText } : {}),
+              ...(obj.parent_tool_use_id ? { parentToolUseId: obj.parent_tool_use_id } : {}),
               timestamp: ts,
             }
             items.push(item)
@@ -1241,6 +1332,7 @@ export class ClaudeAgentManager {
                 toolName: block.name,
                 input: block.input || {},
                 status: 'completed',
+                ...(obj.parent_tool_use_id ? { parentToolUseId: obj.parent_tool_use_id } : {}),
                 timestamp: ts,
               }
               toolIndexMap.set(block.id, items.length)

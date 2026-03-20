@@ -1,12 +1,13 @@
-import type { AppSettings, ShellType, FontType, ColorPresetId, EnvVariable, AgentCommandType } from '../types'
+import type { AppSettings, ShellType, FontType, ColorPresetId, EnvVariable, AgentCommandType, StatuslineItemConfig, StatuslineItemId, LanguageCode } from '../types'
 import type { AgentPresetId } from '../types/agent-presets'
-import { FONT_OPTIONS, COLOR_PRESETS, AGENT_COMMAND_OPTIONS } from '../types'
+import { FONT_OPTIONS, COLOR_PRESETS, AGENT_COMMAND_OPTIONS, STATUSLINE_ITEMS } from '../types'
 
 type Listener = () => void
 
 const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows');
 
 const defaultSettings: AppSettings = {
+  language: 'en',
   shell: 'auto',
   customShellPath: '',
   fontSize: 14,
@@ -43,6 +44,12 @@ class SettingsStore {
 
   private notify(): void {
     this.listeners.forEach(listener => listener())
+  }
+
+  setLanguage(language: LanguageCode): void {
+    this.settings = { ...this.settings, language }
+    this.notify()
+    this.save()
   }
 
   setShell(shell: ShellType): void {
@@ -208,6 +215,25 @@ class SettingsStore {
     return preset || COLOR_PRESETS[0]
   }
 
+  // Statusline configuration
+  getStatuslineItems(): StatuslineItemConfig[] {
+    if (this.settings.statuslineItems?.length) {
+      const savedIds = new Set(this.settings.statuslineItems.map(i => i.id))
+      const missing = STATUSLINE_ITEMS
+        .filter(d => !savedIds.has(d.id))
+        .map(d => ({ id: d.id, visible: d.defaultVisible, align: 'left' as const }))
+      return [...this.settings.statuslineItems, ...missing]
+    }
+    // Default template: gitBranch(#61afef),sessionId(#d19a66) > tokens,turns,duration > contextPct(#d19a66),cost > usage5h,usage5hReset > usage7d(#e5c07b),usage7dReset(#e5c07b) > prompts(#d19a66)
+    return parseStatuslineTemplate('gitBranch(#61afef),sessionId(#d19a66) > tokens,turns,duration > contextPct(#d19a66),cost > usage5h,usage5hReset > usage7d(#e5c07b),usage7dReset(#e5c07b) > prompts(#d19a66)')
+  }
+
+  setStatuslineItems(items: StatuslineItemConfig[]): void {
+    this.settings = { ...this.settings, statuslineItems: items }
+    this.notify()
+    this.save()
+  }
+
   // Get the actual CSS font-family string based on settings
   getFontFamilyString(): string {
     if (this.settings.fontFamily === 'custom' && this.settings.customFontFamily) {
@@ -237,3 +263,69 @@ class SettingsStore {
 }
 
 export const settingsStore = new SettingsStore()
+
+// Parse a single token like "sessionId(#e06c75)" → { id: "sessionId", color: "#e06c75" }
+function parseToken(token: string): { id: string; color?: string } {
+  const match = token.match(/^(\w+)\(([^)]+)\)$/)
+  if (match) return { id: match[1], color: match[2] }
+  return { id: token }
+}
+
+// Template string → config
+// Format: "sessionId(#e06c75),tokens > cost | prompts"
+export function parseStatuslineTemplate(template: string): StatuslineItemConfig[] {
+  const allIds = new Set(STATUSLINE_ITEMS.map(d => d.id))
+  const alignZones = template.split('|').map(s => s.trim())
+  const aligns: Array<'left' | 'center' | 'right'> =
+    alignZones.length >= 3 ? ['left', 'center', 'right'] :
+    alignZones.length === 2 ? ['left', 'right'] : ['left']
+
+  const result: StatuslineItemConfig[] = []
+  const seenIds = new Set<string>()
+
+  for (let zi = 0; zi < alignZones.length && zi < 3; zi++) {
+    const align = aligns[zi]
+    const sections = alignZones[zi].split('>').map(s => s.trim()).filter(Boolean)
+    for (let si = 0; si < sections.length; si++) {
+      const tokens = sections[si].split(',').map(s => s.trim()).filter(Boolean)
+      for (let ii = 0; ii < tokens.length; ii++) {
+        const { id, color } = parseToken(tokens[ii])
+        if (!allIds.has(id) || seenIds.has(id)) continue
+        seenIds.add(id)
+        result.push({
+          id: id as StatuslineItemId,
+          visible: true,
+          align,
+          color,
+          separatorAfter: ii === tokens.length - 1 && si < sections.length - 1,
+        })
+      }
+    }
+  }
+  for (const def of STATUSLINE_ITEMS) {
+    if (!seenIds.has(def.id)) {
+      result.push({ id: def.id, visible: false, align: 'left' })
+    }
+  }
+  return result
+}
+
+// Config → template string
+export function exportStatuslineTemplate(items: StatuslineItemConfig[]): string {
+  const zones: Record<string, string[][]> = { left: [[]], center: [[]], right: [[]] }
+  for (const item of items.filter(i => i.visible)) {
+    const align = item.align || 'left'
+    if (!zones[align]) zones[align] = [[]]
+    const token = item.color ? `${item.id}(${item.color})` : item.id
+    zones[align][zones[align].length - 1].push(token)
+    if (item.separatorAfter) zones[align].push([])
+  }
+  const fmt = (sections: string[][]) =>
+    sections.filter(s => s.length).map(s => s.join(',')).join(' > ')
+  const left = fmt(zones.left)
+  const center = fmt(zones.center)
+  const right = fmt(zones.right)
+  if (center) return [left, center, right].filter(Boolean).join(' | ')
+  if (right) return [left, right].filter(Boolean).join(' | ')
+  return left
+}

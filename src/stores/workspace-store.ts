@@ -18,23 +18,86 @@ class WorkspaceStore {
   private listeners: Set<Listener> = new Set()
 
   // Global Claude usage (shared across all panels)
+  // Adaptive polling: backs off on rate limits, pauses when hidden, refreshes on focus
   private _claudeUsage: { fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null = null
-  private _usageTimer: ReturnType<typeof setInterval> | null = null
+  private _usageTimer: ReturnType<typeof setTimeout> | null = null
+  private _usagePollingStarted = false
+  private _usageInflight = false
+  private _usageBaseInterval = 120 * 1000            // 2 min normal (API has strict rate limits)
+  private _usageCurrentInterval = 120 * 1000
+  private _usageMaxInterval = 30 * 60 * 1000       // 30 min max backoff
+  private _usageMinInterval = 60 * 1000             // 1 min min (after activity)
+  private _usageRateLimitMin = 120 * 1000           // 2 min min when rate limited
+  private _visibilityHandler: (() => void) | null = null
 
   get claudeUsage() { return this._claudeUsage }
 
-  startUsagePolling() {
-    if (this._usageTimer) return
-    const fetch = () => {
-      window.electronAPI.claude.getUsage().then(u => {
-        if (u) {
-          this._claudeUsage = u
-          this.notify()
-        }
-      }).catch(() => {})
+  private async _fetchUsage() {
+    if (this._usageInflight) return
+    this._usageInflight = true
+    try {
+      const u = await window.electronAPI.claude.getUsage()
+      if (!u) return
+
+      // Handle rate-limit response from main process
+      if ('rateLimited' in u && (u as any).rateLimited) {
+        const retryAfterMs = ((u as any).retryAfterSec || 60) * 1000
+        this._usageCurrentInterval = Math.min(
+          Math.max(retryAfterMs, this._usageCurrentInterval * 2),
+          this._usageMaxInterval
+        )
+        return
+      }
+
+      // Success — reset to base interval
+      this._usageCurrentInterval = this._usageBaseInterval
+      this._claudeUsage = u
+      this.notify()
+    } catch {
+      // Network error — double the interval (exponential backoff)
+      this._usageCurrentInterval = Math.min(this._usageCurrentInterval * 2, this._usageMaxInterval)
+    } finally {
+      this._usageInflight = false
     }
-    fetch()
-    this._usageTimer = setInterval(fetch, 5 * 60 * 1000)
+  }
+
+  private _scheduleNextPoll() {
+    if (this._usageTimer) clearTimeout(this._usageTimer)
+    this._usageTimer = setTimeout(async () => {
+      await this._fetchUsage()
+      this._scheduleNextPoll()
+    }, this._usageCurrentInterval)
+  }
+
+  startUsagePolling() {
+    if (this._usagePollingStarted) return
+    this._usagePollingStarted = true
+
+    // Initial fetch
+    this._fetchUsage().then(() => this._scheduleNextPoll())
+
+    // Visibility-aware: pause when hidden, immediate refresh on focus
+    this._visibilityHandler = () => {
+      if (document.hidden) {
+        // Pause polling when tab/window is hidden
+        if (this._usageTimer) {
+          clearTimeout(this._usageTimer)
+          this._usageTimer = null
+        }
+      } else {
+        // Window regained focus — fetch immediately then resume schedule
+        this._fetchUsage().then(() => this._scheduleNextPoll())
+      }
+    }
+    document.addEventListener('visibilitychange', this._visibilityHandler)
+  }
+
+  /** Call after agent activity (turn completed, session ended) for a timely refresh */
+  refreshUsageNow() {
+    if (!this._usagePollingStarted) return
+    // Use shorter interval temporarily after activity
+    this._usageCurrentInterval = this._usageMinInterval
+    this._fetchUsage().then(() => this._scheduleNextPoll())
   }
 
   getState(): AppState {
@@ -167,6 +230,17 @@ class WorkspaceStore {
       )
     }
     this.notify()
+    this.save()
+  }
+
+  setTerminalSessionMeta(terminalId: string, meta: { totalCost: number; inputTokens: number; outputTokens: number; durationMs: number; numTurns: number; contextWindow: number }): void {
+    this.state = {
+      ...this.state,
+      terminals: this.state.terminals.map(t =>
+        t.id === terminalId ? { ...t, sessionMeta: meta } : t
+      )
+    }
+    // Don't notify — this is a background persistence update, no UI re-render needed
     this.save()
   }
 
@@ -456,6 +530,7 @@ class WorkspaceStore {
       cwd: t.cwd,
       sdkSessionId: t.sdkSessionId,
       model: t.model,
+      sessionMeta: t.sessionMeta,
     }))
     const data = JSON.stringify({
       workspaces: this.state.workspaces,
@@ -483,6 +558,7 @@ class WorkspaceStore {
           cwd: t.cwd || '',
           sdkSessionId: t.sdkSessionId,
           model: t.model,
+          sessionMeta: t.sessionMeta,
           scrollbackBuffer: [],
           pid: undefined,
         }))

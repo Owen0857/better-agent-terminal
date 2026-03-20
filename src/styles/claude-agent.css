@@ -977,9 +977,10 @@
 .claude-input-area {
   display: flex;
   flex-direction: column;
-  margin: 0 12px 12px;
+  margin: 0 12px 0;
   border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  border-bottom: none;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
   background: var(--bg-secondary);
   overflow: hidden;
   transition: border-color 0.15s;
@@ -1601,21 +1602,36 @@
   font-style: italic;
 }
 
-/* Status Lines */
-.claude-statuslines {
+/* Status Line Bar — attached to input-area when visible, standalone otherwise */
+.claude-statusline-bar {
   flex-shrink: 0;
-  border-top: 1px solid var(--border-color);
+  margin: 0 12px 12px;
   background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.claude-statusline-bar.attached {
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  margin-top: 0;
 }
 
 .claude-statusline {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
   padding: 3px 12px;
-  font-size: calc(var(--claude-font-size) - 2px);
+  font-size: var(--claude-font-size);
   color: var(--text-secondary);
   min-height: 22px;
+}
+
+.claude-statusline-left,
+.claude-statusline-center,
+.claude-statusline-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .claude-statusline-sep {
@@ -1900,4 +1916,64 @@
 .claude-account-info {
   font-size: calc(var(--claude-font-size) - 2px);
   opacity: 0.7;
+}
+
+/* ============================================
+   Subagent Modal
+   ============================================ */
+.claude-subagent-modal {
+  width: 80vw;
+  max-width: 1000px;
+  height: 80vh;
+  max-height: 800px;
+}
+
+.claude-subagent-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+
+.claude-subagent-body .claude-messages {
+  padding: 8px 0;
+}
+
+.claude-subagent-meta {
+  font-size: calc(var(--claude-font-size) - 2px);
+  color: var(--text-secondary);
+  margin-left: auto;
+  margin-right: 12px;
+}
+
+.claude-subagent-view-btn {
+  font-size: calc(var(--claude-font-size) - 2px);
+  color: var(--claude-accent);
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 1px 6px;
+  cursor: pointer;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+
+.claude-subagent-view-btn:hover {
+  background: var(--bg-hover);
+}
+
+.claude-subagent-log-btn {
+  font-size: calc(var(--claude-font-size) - 2px);
+  font-weight: 600;
+  color: #1a1a1a;
+  background: #d29922;
+  border: none;
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+
+.claude-subagent-log-btn:hover {
+  background: #e5a82e;
 }
