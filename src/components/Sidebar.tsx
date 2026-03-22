@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { Workspace } from '../types'
+import { WORKSPACE_COLORS } from '../types'
 import { workspaceStore } from '../stores/workspace-store'
 import { ActivityIndicator } from './ActivityIndicator'
 
@@ -298,6 +299,9 @@ export function Sidebar({
             onDragLeave={handleDragLeave}
             onDrop={(e) => handleDrop(e, workspace.id)}
           >
+            {workspace.color && (
+              <div className="workspace-color-bar" style={{ backgroundColor: workspace.color }} />
+            )}
             <div className="workspace-item-content">
               <div className="drag-handle" title={t('sidebar.dragToReorder')}>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
@@ -420,6 +424,47 @@ export function Sidebar({
             </svg>
             {t('sidebar.setGroup')}
           </div>
+          {(() => {
+            const ws = workspaces.find(w => w.id === contextMenu.workspaceId)
+            return (
+              <div className="context-menu-item context-menu-color-picker">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="13.5" cy="6.5" r="2.5" />
+                  <circle cx="17.5" cy="10.5" r="2.5" />
+                  <circle cx="8.5" cy="7.5" r="2.5" />
+                  <circle cx="6.5" cy="12" r="2.5" />
+                  <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.5-.7 1.5-1.5 0-.4-.1-.7-.4-1-.3-.3-.4-.6-.4-1 0-.8.7-1.5 1.5-1.5H16c3.3 0 6-2.7 6-6 0-5.5-4.5-9-10-9z" />
+                </svg>
+                {t('sidebar.setColor')}
+                <div className="color-palette">
+                  {WORKSPACE_COLORS.map(c => (
+                    <div
+                      key={c.id}
+                      className={`color-dot ${ws?.color === c.value ? 'active' : ''}`}
+                      style={{ backgroundColor: c.value }}
+                      title={c.label}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        workspaceStore.setWorkspaceColor(contextMenu.workspaceId, c.value)
+                        setContextMenu(null)
+                      }}
+                    />
+                  ))}
+                  {ws?.color && (
+                    <div
+                      className="color-dot clear"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        workspaceStore.setWorkspaceColor(contextMenu.workspaceId, undefined)
+                        setContextMenu(null)
+                      }}
+                      title={t('sidebar.clearColor')}
+                    >&#x2715;</div>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
           <div
             className="context-menu-item"
             onClick={() => {

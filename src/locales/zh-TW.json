@@ -93,6 +93,8 @@
     "openInExplorer": "在檔案管理員中開啟",
     "openOnGithub": "在 GitHub 上開啟",
     "setGroup": "設定群組...",
+    "setColor": "設定顏色",
+    "clearColor": "清除顏色",
     "environmentVariables": "環境變數",
     "detachToWindow": "分離至新視窗",
     "wakeAgent": "喚醒 Agent",

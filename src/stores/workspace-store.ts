@@ -472,6 +472,17 @@ class WorkspaceStore {
     this.save()
   }
 
+  setWorkspaceColor(id: string, color: string | undefined): void {
+    this.state = {
+      ...this.state,
+      workspaces: this.state.workspaces.map(w =>
+        w.id === id ? { ...w, color } : w
+      )
+    }
+    this.notify()
+    this.save()
+  }
+
   getGroups(): string[] {
     const groups = new Set<string>()
     for (const w of this.state.workspaces) {

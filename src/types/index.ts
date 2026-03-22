@@ -16,8 +16,20 @@ export interface Workspace {
   defaultAgent?: AgentPresetId;  // Workspace 預設 Agent
   envVars?: EnvVariable[];       // Workspace 專屬環境變數
   group?: string;                // Workspace 分組
+  color?: string;                // Workspace 顏色標籤
   lastSdkSessionId?: string;     // 上次使用的 SDK session ID，下次自動 resume
 }
+
+export const WORKSPACE_COLORS = [
+  { id: 'red', value: '#e74c3c', label: 'Red' },
+  { id: 'orange', value: '#e67e22', label: 'Orange' },
+  { id: 'yellow', value: '#f1c40f', label: 'Yellow' },
+  { id: 'green', value: '#2ecc71', label: 'Green' },
+  { id: 'blue', value: '#3498db', label: 'Blue' },
+  { id: 'purple', value: '#9b59b6', label: 'Purple' },
+  { id: 'pink', value: '#e91e8a', label: 'Pink' },
+  { id: 'gray', value: '#95a5a6', label: 'Gray' },
+] as const
 
 export interface TerminalInstance {
   id: string;

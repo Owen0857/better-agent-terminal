@@ -93,6 +93,8 @@
     "openInExplorer": "Open in Explorer",
     "openOnGithub": "Open on GitHub",
     "setGroup": "Set Group...",
+    "setColor": "Set Color",
+    "clearColor": "Clear color",
     "environmentVariables": "Environment Variables",
     "detachToWindow": "Detach to Window",
     "wakeAgent": "Wake Agent",
