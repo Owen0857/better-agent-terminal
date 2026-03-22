@@ -811,6 +811,34 @@ function registerProxiedHandlers() {
   })
 
   // File system
+  // File watcher for auto-refresh
+  const fileWatchers = new Map<string, ReturnType<typeof fsSync.watch>>()
+  registerHandler('fs:watch', (_dirPath: string) => {
+    if (fileWatchers.has(_dirPath)) return true
+    try {
+      let debounceTimer: ReturnType<typeof setTimeout> | null = null
+      const watcher = fsSync.watch(_dirPath, { recursive: true }, () => {
+        if (debounceTimer) clearTimeout(debounceTimer)
+        debounceTimer = setTimeout(() => {
+          broadcastHub.broadcast('fs:changed', _dirPath)
+        }, 500)
+      })
+      watcher.on('error', () => {
+        fileWatchers.delete(_dirPath)
+      })
+      fileWatchers.set(_dirPath, watcher)
+      return true
+    } catch { return false }
+  })
+  registerHandler('fs:unwatch', (_dirPath: string) => {
+    const watcher = fileWatchers.get(_dirPath)
+    if (watcher) {
+      watcher.close()
+      fileWatchers.delete(_dirPath)
+    }
+    return true
+  })
+
   registerHandler('fs:readdir', async (dirPath: string) => {
     const IGNORED = new Set(['.git', 'node_modules', '.next', 'dist', 'dist-electron', '.cache', '__pycache__', '.DS_Store'])
     try {

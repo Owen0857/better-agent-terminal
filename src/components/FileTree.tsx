@@ -214,6 +214,20 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
     loadRoot()
   }, [loadRoot])
 
+  // Watch for file system changes and auto-refresh
+  useEffect(() => {
+    window.electronAPI.fs.watch(rootPath)
+    const unsubscribe = window.electronAPI.fs.onChanged((changedPath: string) => {
+      if (changedPath === rootPath) {
+        loadRoot()
+      }
+    })
+    return () => {
+      unsubscribe()
+      window.electronAPI.fs.unwatch(rootPath)
+    }
+  }, [rootPath, loadRoot])
+
   // Close context menu on outside click
   useEffect(() => {
     if (!contextMenu) return
