@@ -173,7 +173,7 @@ function renderMarkdown(text: string): string {
   return html
 }
 
-function FilePreview({ filePath, fileName }: { filePath: string; fileName: string }) {
+function FilePreview({ filePath, fileName, refreshKey }: { filePath: string; fileName: string; refreshKey: number }) {
   const [content, setContent] = useState<string | null>(null)
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -215,7 +215,7 @@ function FilePreview({ filePath, fileName }: { filePath: string; fileName: strin
     }
 
     return () => { cancelled = true }
-  }, [filePath, fileName])
+  }, [filePath, fileName, refreshKey])
 
   if (loading) {
     return <div className="file-preview-status">Loading...</div>
@@ -264,6 +264,7 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
   const [searchResults, setSearchResults] = useState<FileEntry[] | null>(null)
   const [searching, setSearching] = useState(false)
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
 
   const loadRoot = useCallback(async () => {
     setLoading(true)
@@ -276,6 +277,11 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
     setLoading(false)
   }, [rootPath])
 
+  const handleRefresh = useCallback(() => {
+    setRefreshKey(k => k + 1)
+    loadRoot()
+  }, [loadRoot])
+
   useEffect(() => {
     loadRoot()
   }, [loadRoot])
@@ -285,6 +291,7 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
     window.electronAPI.fs.watch(rootPath)
     const unsubscribe = window.electronAPI.fs.onChanged((changedPath: string) => {
       if (changedPath === rootPath) {
+        setRefreshKey(k => k + 1)
         loadRoot()
       }
     })
@@ -410,7 +417,7 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
-          <button className="file-tree-refresh-btn" onClick={loadRoot} title="Refresh">↻</button>
+          <button className="file-tree-refresh-btn" onClick={handleRefresh} title="Refresh">↻</button>
         </div>
         <div className="file-tree-list">
           {searching && <div className="file-tree-item file-tree-loading-row">Searching...</div>}
@@ -433,7 +440,7 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
           ) : (
             entries.map(entry => (
               <FileTreeNode
-                key={entry.path}
+                key={`${entry.path}:${refreshKey}`}
                 entry={entry}
                 depth={0}
                 selectedPath={selectedFile?.path || null}
@@ -452,9 +459,10 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
           <>
             <div className="file-preview-header">
               <span className="file-preview-filename">{selectedFile.name}</span>
+              <button className="file-tree-refresh-btn" onClick={handleRefresh} title="Refresh">↻</button>
             </div>
             <div className="file-preview-body">
-              <FilePreview filePath={selectedFile.path} fileName={selectedFile.name} />
+              <FilePreview filePath={selectedFile.path} fileName={selectedFile.name} refreshKey={refreshKey} />
             </div>
           </>
         ) : (
