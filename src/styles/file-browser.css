@@ -636,12 +636,23 @@
   color: var(--text-secondary);
 }
 
-/* Mermaid placeholder (Phase 3) */
-.file-preview-markdown .mermaid-placeholder {
-  border: 1px dashed var(--border-color);
+/* Mermaid diagrams */
+.file-preview-markdown .mermaid {
+  margin: 0.5em 0;
+  text-align: center;
+}
+
+.file-preview-markdown .mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.file-preview-markdown .mermaid-error {
+  border: 1px dashed #e74c3c;
   border-radius: 4px;
   padding: 8px 12px;
-  margin: 0.5em 0;
-  color: var(--text-secondary);
-  font-style: italic;
+  color: #e74c3c;
+  font-family: monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
 }

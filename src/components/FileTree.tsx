@@ -136,9 +136,9 @@ marked.setOptions({
 const renderer = new marked.Renderer()
 
 renderer.code = function ({ text, lang }: { text: string; lang?: string }) {
-  // Mermaid blocks: render as placeholder div (Phase 3 will handle rendering)
+  // Mermaid blocks: render as div with class "mermaid" for post-render processing
   if (lang === 'mermaid') {
-    return `<div class="mermaid-placeholder"><pre><code>${text}</code></pre></div>`
+    return `<div class="mermaid">${text}</div>`
   }
   let highlighted: string
   try {
@@ -170,6 +170,73 @@ function renderMarkdown(text: string): string {
     ADD_TAGS: ['input'],  // Allow checkboxes for task lists
     ADD_ATTR: ['checked', 'disabled', 'type', 'data-external-link'],
   })
+}
+
+// Mermaid rendering: dynamically import mermaid only when needed
+let mermaidInstance: typeof import('mermaid')['default'] | null = null
+
+async function getMermaid() {
+  if (!mermaidInstance) {
+    mermaidInstance = (await import('mermaid')).default
+    mermaidInstance.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      themeVariables: {
+        darkMode: true,
+        background: '#1e1e1e',
+        primaryColor: '#3498db',
+        primaryTextColor: '#e0e0e0',
+        lineColor: '#666',
+      },
+    })
+  }
+  return mermaidInstance
+}
+
+async function renderMermaidBlocks(container: HTMLElement) {
+  const mermaidDivs = container.querySelectorAll('.mermaid')
+  if (mermaidDivs.length === 0) return
+
+  const mermaid = await getMermaid()
+  mermaidDivs.forEach((div, i) => {
+    div.id = `mermaid-${Date.now()}-${i}`
+  })
+  try {
+    await mermaid.run({ nodes: mermaidDivs as unknown as ArrayLike<HTMLElement> })
+  } catch {
+    mermaidDivs.forEach(div => {
+      if (!div.querySelector('svg')) {
+        div.classList.add('mermaid-error')
+      }
+    })
+  }
+}
+
+function MarkdownPreview({ content }: { content: string }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const html = renderMarkdown(content)
+
+  useEffect(() => {
+    if (containerRef.current) {
+      renderMermaidBlocks(containerRef.current)
+    }
+  }, [html])
+
+  return (
+    <div
+      ref={containerRef}
+      className="file-preview-markdown"
+      dangerouslySetInnerHTML={{ __html: html }}
+      onClick={(e) => {
+        const target = e.target as HTMLElement
+        const link = target.closest('a[data-external-link]') as HTMLAnchorElement | null
+        if (link) {
+          e.preventDefault()
+          window.electronAPI.shell.openExternal(link.href)
+        }
+      }}
+    />
+  )
 }
 
 function FilePreview({ filePath, fileName, refreshKey }: { filePath: string; fileName: string; refreshKey: number }) {
@@ -242,19 +309,7 @@ function FilePreview({ filePath, fileName, refreshKey }: { filePath: string; fil
           </div>
         )}
         {isMarkdown && viewMode === 'rendered'
-          ? <div
-              className="file-preview-markdown"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-              onClick={(e) => {
-                // Intercept link clicks → open in external browser
-                const target = e.target as HTMLElement
-                const link = target.closest('a[data-external-link]') as HTMLAnchorElement | null
-                if (link) {
-                  e.preventDefault()
-                  window.electronAPI.shell.openExternal(link.href)
-                }
-              }}
-            />
+          ? <MarkdownPreview content={content} />
           : <HighlightedCode code={content} ext={getFileExt(fileName)} className="file-preview-text" />
         }
       </>
