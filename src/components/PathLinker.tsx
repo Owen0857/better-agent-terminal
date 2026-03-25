@@ -103,9 +103,9 @@ const PATH_RE = /(?:[A-Za-z]:[\\\/]|\/(?:Users|home|tmp|var|opt|etc|usr|mnt|srv|
 type TokenType = 'text' | 'path' | 'url' | 'mdlink'
 interface Token { type: TokenType; text: string; href?: string }
 
-// Markdown link: [text](url)  |  Bare URL: https://... or http://...
-const MD_LINK_RE = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
-const URL_RE = /https?:\/\/[^\s<>)\]]+/g
+// Markdown link: [text](url)  |  Bare URL: https://..., http://..., or file:///...
+const MD_LINK_RE = /\[([^\]]+)\]\(((?:https?|file):\/\/[^\s)]+)\)/g
+const URL_RE = /(?:https?|file):\/\/[^\s<>)\]]+/g
 
 function tokenize(text: string): Token[] {
   // Pass 1: extract markdown links and bare URLs
