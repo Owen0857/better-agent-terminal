@@ -2029,6 +2029,9 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {item.result && (() => {
                 const raw = typeof item.result === 'string' ? item.result : String(item.result)
                 const { content: outText, reminders, errors } = splitSystemReminders(raw)
+                // Hide output by default for read-only tools (Read, Glob, Grep, LS, NotebookRead)
+                const isReadOnlyTool = ['Read', 'Glob', 'Grep', 'LS', 'NotebookRead'].includes(item.toolName)
+                const isOutExpanded = expandedTools.has(outBlockId)
                 return (
                   <>
                     {errors.length > 0 && errors.map((err, i) => (
@@ -2037,7 +2040,22 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                         <span className="claude-tool-row-content">{err}</span>
                       </div>
                     ))}
-                    {outText && (
+                    {outText && isReadOnlyTool && (
+                      <div
+                        className="claude-tool-row"
+                        onClick={() => toggleTool(outBlockId)}
+                      >
+                        <span className="claude-tool-row-label">{t('claude.out')}</span>
+                        <span className="claude-tool-row-content">
+                          {isOutExpanded
+                            ? <LinkedText text={outText} />
+                            : <span className="claude-tool-collapsed-hint">{outText.split('\n').length} lines</span>
+                          }
+                        </span>
+                        <span className={`claude-tool-chevron ${isOutExpanded ? 'expanded' : ''}`}>&#9654;</span>
+                      </div>
+                    )}
+                    {outText && !isReadOnlyTool && (
                       <div
                         className="claude-tool-row"
                         onClick={() => handleCopyBlock(outText, outBlockId)}
