@@ -27,6 +27,17 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
 
   const getHistory = () => historyMap.get(terminalId) || []
 
+  const resizeTextarea = () => {
+    const ta = textareaRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`
+  }
+
+  useEffect(() => {
+    resizeTextarea()
+  }, [text])
+
   const handleSend = async () => {
     const content = text.trim()
     if (!content && !imagePath) return
@@ -81,9 +92,9 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
     const textarea = textareaRef.current
     const isMultiLine = text.includes('\n')
 
-    // Up arrow: navigate history only when single-line or already browsing history
+    // Up arrow: only navigate history for single-line input
     if (e.key === 'ArrowUp') {
-      if (isMultiLine && historyIndex === -1) return // let textarea handle cursor movement
+      if (isMultiLine) return // always let textarea handle cursor movement in multi-line
       if (textarea && textarea.selectionStart !== 0) return
 
       e.preventDefault()
@@ -96,9 +107,9 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
       return
     }
 
-    // Down arrow: navigate history only when single-line or already browsing history
+    // Down arrow: only navigate history for single-line input
     if (e.key === 'ArrowDown') {
-      if (isMultiLine && historyIndex === -1) return
+      if (isMultiLine) return // always let textarea handle cursor movement in multi-line
       if (textarea && textarea.selectionStart !== textarea.value.length) return
       if (historyIndex === -1) return
 
@@ -121,12 +132,6 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
     if (historyIndex !== -1) {
       setHistoryIndex(-1)
       draftRef.current = ''
-    }
-    // Auto-resize textarea height
-    const ta = textareaRef.current
-    if (ta) {
-      ta.style.height = 'auto'
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`
     }
   }
 

@@ -20,7 +20,7 @@ class WorkspaceStore {
 
   // Global Claude usage (shared across all panels)
   // Adaptive polling: backs off on rate limits, pauses when hidden, refreshes on focus
-  private _claudeUsage: { fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null = null
+  private _claudeUsage: { fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null; fiveHourStale?: boolean } | null = null
   private _usageTimer: ReturnType<typeof setTimeout> | null = null
   private _usagePollingStarted = false
   private _usageInflight = false
@@ -30,15 +30,42 @@ class WorkspaceStore {
   private _usageMinInterval = 60 * 1000             // 1 min min (after activity)
   private _usageRateLimitMin = 120 * 1000           // 2 min min when rate limited
   private _visibilityHandler: (() => void) | null = null
+  // One-shot timer: starts on first failure, cancelled on success, fires once to mark stale
+  private _fiveHourStaleTimer: ReturnType<typeof setTimeout> | null = null
+  private static readonly _FIVE_HOUR_STALE_MS = 10 * 60 * 1000  // 10 min without data → show --%
 
   get claudeUsage() { return this._claudeUsage }
+
+  private _clearFiveHourStaleTimer() {
+    if (this._fiveHourStaleTimer) {
+      clearTimeout(this._fiveHourStaleTimer)
+      this._fiveHourStaleTimer = null
+    }
+  }
+
+  /** Start the stale timer only if not already running and not already stale */
+  private _startFiveHourStaleTimerIfNeeded() {
+    if (this._fiveHourStaleTimer !== null) return   // timer already running — don't reset
+    if (this._claudeUsage?.fiveHourStale) return    // already stale — nothing to do
+    this._fiveHourStaleTimer = setTimeout(() => {
+      this._fiveHourStaleTimer = null
+      const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+      this._claudeUsage = { ...prev, fiveHourStale: true }
+      window.electronAPI.debug.log(`[usage:poll] 5h stale — no data for ${WorkspaceStore._FIVE_HOUR_STALE_MS / 60000} min`)
+      this.notify()
+    }, WorkspaceStore._FIVE_HOUR_STALE_MS)
+  }
 
   private async _fetchUsage() {
     if (this._usageInflight) return
     this._usageInflight = true
     try {
       const u = await window.electronAPI.claude.getUsage()
-      if (!u) return
+      if (!u) {
+        // null = both auth methods returned non-OK (e.g. 401/403/5xx) — counts as a failure
+        this._startFiveHourStaleTimerIfNeeded()
+        return
+      }
 
       // Handle rate-limit response from main process
       // Use server's retryAfterSec directly — do not double existing interval,
@@ -46,16 +73,21 @@ class WorkspaceStore {
       if ('rateLimited' in u && (u as any).rateLimited) {
         const retryAfterMs = ((u as any).retryAfterSec || 60) * 1000
         this._usageCurrentInterval = Math.min(retryAfterMs, this._usageMaxInterval)
+        window.electronAPI.debug.log(`[usage:poll] rate-limited, retry in ${Math.round(this._usageCurrentInterval / 1000)}s`)
+        this._startFiveHourStaleTimerIfNeeded()
         return
       }
 
-      // Success — reset to base interval
+      // Success — cancel stale timer, clear stale flag, reset poll interval
+      this._clearFiveHourStaleTimer()
       this._usageCurrentInterval = this._usageBaseInterval
-      this._claudeUsage = u
+      window.electronAPI.debug.log(`[usage:poll] OK 5h=${(u as any).fiveHour} 7d=${(u as any).sevenDay} 5hReset=${(u as any).fiveHourReset} 7dReset=${(u as any).sevenDayReset}`)
+      this._claudeUsage = { ...(u as any), fiveHourStale: false }
       this.notify()
     } catch {
       // Network error — double the interval (exponential backoff)
       this._usageCurrentInterval = Math.min(this._usageCurrentInterval * 2, this._usageMaxInterval)
+      this._startFiveHourStaleTimerIfNeeded()
     } finally {
       this._usageInflight = false
     }
@@ -97,7 +129,8 @@ class WorkspaceStore {
     const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
     const resetIso = info.resetsAt ? new Date(info.resetsAt).toISOString() : null
     if (info.rateLimitType === 'five_hour') {
-      this._claudeUsage = { ...prev, fiveHour: info.utilization, fiveHourReset: resetIso }
+      this._clearFiveHourStaleTimer()
+      this._claudeUsage = { ...prev, fiveHour: info.utilization, fiveHourReset: resetIso, fiveHourStale: false }
     } else if (info.rateLimitType === 'seven_day' || info.rateLimitType === 'seven_day_opus' || info.rateLimitType === 'seven_day_sonnet') {
       this._claudeUsage = { ...prev, sevenDay: info.utilization, sevenDayReset: resetIso }
     }

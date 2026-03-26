@@ -19,7 +19,16 @@
       "Bash(git config:*)",
       "Bash(npm run build:release:*)",
       "Bash(cat:*)",
-      "Bash(npx electron:*)"
+      "Bash(npx electron:*)",
+      "Skill(commit-commands:commit-push-pr)",
+      "Skill(commit-commands:commit-push-pr:*)",
+      "Bash(gh repo:*)",
+      "Bash(where gh:*)",
+      "Read(//c/Program Files/GitHub CLI/**)",
+      "Read(//c/Users/OwenLi/AppData/Local/Programs/GitHub CLI/**)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }

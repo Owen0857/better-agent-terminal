@@ -816,6 +816,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   // Update usage from SDK rate_limit_event (no polling needed, fires on every query)
   useEffect(() => {
     return window.electronAPI.claude.onUsageUpdate((info) => {
+      window.electronAPI.debug.log(`[usage:rate_limit_event] type=${info.rateLimitType} util=${info.utilization} resetsAt=${info.resetsAt ?? 'none'}`)
       workspaceStore.applyRateLimitEvent(info)
     })
   }, [])
@@ -2050,8 +2051,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {item.result && (() => {
                 const raw = typeof item.result === 'string' ? item.result : String(item.result)
                 const { content: outText, reminders, errors } = splitSystemReminders(raw)
-                // Hide output by default for read-only tools (Read, Glob, Grep, LS, NotebookRead)
-                const isReadOnlyTool = ['Read', 'Glob', 'Grep', 'LS', 'NotebookRead'].includes(item.toolName)
+                // All tool outputs collapsed by default — click to expand
                 const isOutExpanded = expandedTools.has(outBlockId)
                 return (
                   <>
@@ -2061,7 +2061,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                         <span className="claude-tool-row-content">{err}</span>
                       </div>
                     ))}
-                    {outText && isReadOnlyTool && (
+                    {outText && (
                       <div
                         className="claude-tool-row"
                         onClick={() => toggleTool(outBlockId)}
@@ -2073,20 +2073,15 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                             : <span className="claude-tool-collapsed-hint">{outText.split('\n').length} lines</span>
                           }
                         </span>
+                        {isOutExpanded && (
+                          <span
+                            className={`claude-tool-row-copy ${copiedId === outBlockId ? 'copied' : ''}`}
+                            onClick={(e) => { e.stopPropagation(); handleCopyBlock(outText, outBlockId) }}
+                          >
+                            {copiedId === outBlockId ? '✓' : '⧉'}
+                          </span>
+                        )}
                         <span className={`claude-tool-chevron ${isOutExpanded ? 'expanded' : ''}`}>&#9654;</span>
-                      </div>
-                    )}
-                    {outText && !isReadOnlyTool && (
-                      <div
-                        className="claude-tool-row"
-                        onClick={() => handleCopyBlock(outText, outBlockId)}
-                        title={t('claude.clickToCopy')}
-                      >
-                        <span className="claude-tool-row-label">{t('claude.out')}</span>
-                        <span className="claude-tool-row-content"><LinkedText text={outText} /></span>
-                        <span className={`claude-tool-row-copy ${copiedId === outBlockId ? 'copied' : ''}`}>
-                          {copiedId === outBlockId ? '✓' : '⧉'}
-                        </span>
                       </div>
                     )}
                     {reminders.length > 0 && (
@@ -2902,11 +2897,18 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             const ws = workspaceId ? workspaceStore.getState().workspaces.find(w => w.id === workspaceId) : null
             return ws ? <span key="workspace" className="claude-statusline-item">{ws.alias || ws.name}</span> : null
           },
-          usage5h: () => claudeUsage?.fiveHour == null ? null : (
-            <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ''}`}>
-              5h:{Math.round(claudeUsage.fiveHour)}%
-            </span>
-          ),
+          usage5h: () => {
+            if (!claudeUsage) return null
+            if (claudeUsage.fiveHourStale) return (
+              <span key="usage5h" className="claude-statusline-item claude-usage-stale">5h:--%</span>
+            )
+            if (claudeUsage.fiveHour == null) return null
+            return (
+              <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ''}`}>
+                5h:{Math.round(claudeUsage.fiveHour)}%
+              </span>
+            )
+          },
           usage5hReset: () => {
             if (!claudeUsage?.fiveHourReset) return null
             return <span key="usage5hReset" className="claude-statusline-item">↻{fmtRemaining(new Date(claudeUsage.fiveHourReset))}</span>

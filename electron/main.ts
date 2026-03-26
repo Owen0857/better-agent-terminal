@@ -727,7 +727,7 @@ function registerProxiedHandlers() {
   }
 
   /** Fetch usage via OAuth (fallback — strict rate limits) */
-  async function fetchUsageViaOAuth(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | 'rateLimited' | null> {
+  async function fetchUsageViaOAuth(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | { rateLimited: true; retryAfterSec: number } | null> {
     const token = await getOAuthToken()
     if (!token) return null
 
@@ -740,7 +740,22 @@ function registerProxiedHandlers() {
       },
     })
 
-    if (res.status === 429) return 'rateLimited'
+    if (res.status === 429) {
+      // Read actual Retry-After from server instead of assuming 120s
+      const raw = parseInt(res.headers.get('retry-after') ?? '', 10)
+      const retryAfterSec = Number.isFinite(raw) && raw > 0 ? raw : 120
+      logger.log('[usage] [oauth] rate-limited, retry-after:', retryAfterSec, 's')
+      return { rateLimited: true, retryAfterSec }
+    }
+
+    // P1: clear token cache on auth failure so fresh token is read next poll
+    if (res.status === 401 || res.status === 403) {
+      _cachedOAuthToken = null
+      _tokenCacheTime = 0
+      logger.log('[usage] [oauth] auth error', res.status, '— cleared token cache')
+      return null
+    }
+
     if (!res.ok) return null
 
     const data = await res.json()
@@ -761,8 +776,8 @@ function registerProxiedHandlers() {
 
       // Fall back to OAuth (strict rate limits on api.anthropic.com)
       const oauthResult = await fetchUsageViaOAuth()
-      if (oauthResult === 'rateLimited') {
-        return { rateLimited: true, retryAfterSec: 120 }
+      if (oauthResult && 'rateLimited' in oauthResult) {
+        return oauthResult  // already contains retryAfterSec from actual Retry-After header
       }
       return oauthResult
     } catch (e) {

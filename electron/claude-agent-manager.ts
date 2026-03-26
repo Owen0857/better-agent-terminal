@@ -587,14 +587,17 @@ export class ClaudeAgentManager {
           logger.log(`[claude:msg] type=${message.type} subtype=${msgSubtype || ''} parent_tool_use_id=${(message as { parent_tool_use_id?: string }).parent_tool_use_id || 'none'}`)
         }
         if (message.type === 'rate_limit_event') {
-          logger.log(`[claude:rate_limit_event] ${JSON.stringify(message)}`)
-          const info = (message as { rate_limit_info?: { rateLimitType?: string; utilization?: number; resetsAt?: number } }).rate_limit_info
+          const msg = message as { rate_limit_info?: { rateLimitType?: string; utilization?: number; resetsAt?: number } }
+          const info = msg.rate_limit_info
+          logger.log(`[claude:rate_limit_event] type=${info?.rateLimitType ?? 'MISSING'} util=${info?.utilization ?? 'MISSING'} resetsAt=${info?.resetsAt ?? 'MISSING'} raw=${JSON.stringify(message)}`)
           if (info?.rateLimitType && info.utilization !== undefined) {
             this.send('claude:usage-update', {
               rateLimitType: info.rateLimitType,
               utilization: info.utilization,
               resetsAt: info.resetsAt,
             })
+          } else {
+            logger.log(`[claude:rate_limit_event] SKIPPED — missing rateLimitType or utilization`)
           }
         }
         if (message.type === 'assistant') {

@@ -1689,6 +1689,9 @@
 .claude-usage-high {
   color: #e05252;
 }
+.claude-usage-stale {
+  opacity: 0.45;
+}
 
 /* ============================================
    Prompt History Modal
