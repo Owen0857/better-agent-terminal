@@ -1169,6 +1169,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     if (e.key === 'ArrowUp' && !e.shiftKey && !e.nativeEvent.isComposing) {
       const history = inputHistoryRef.current
       if (history.length === 0) return
+      // In multi-line input, only navigate history when cursor is on the first line
+      const ta = e.currentTarget as HTMLTextAreaElement
+      const firstNewline = ta.value.indexOf('\n')
+      const isOnFirstLine = firstNewline === -1 || ta.selectionStart <= firstNewline
+      if (!isOnFirstLine) return
       e.preventDefault()
       if (inputHistoryIndexRef.current === -1) {
         inputDraftRef.current = inputValueRef.current
@@ -1181,6 +1186,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     }
     if (e.key === 'ArrowDown' && !e.shiftKey && !e.nativeEvent.isComposing) {
       if (inputHistoryIndexRef.current === -1) return
+      // In multi-line input, only navigate history when cursor is on the last line
+      const ta = e.currentTarget as HTMLTextAreaElement
+      const lastNewline = ta.value.lastIndexOf('\n')
+      const isOnLastLine = lastNewline === -1 || ta.selectionStart > lastNewline
+      if (!isOnLastLine) return
       e.preventDefault()
       const history = inputHistoryRef.current
       if (inputHistoryIndexRef.current < history.length - 1) {

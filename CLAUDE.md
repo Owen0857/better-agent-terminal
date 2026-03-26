@@ -4,7 +4,8 @@
 
 - **NEVER** break existing features when implementing new ones.
 - Before committing, verify ALL existing features still work — not just the new changes.
-- Run the build (`npx vite build`) to confirm compilation succeeds.
+- TypeScript check (faster): `node_modules\.bin\tsc.cmd --noEmit`
+- Full build (Windows): `node_modules\.bin\vite.cmd build` — `npx vite build` does NOT work on this machine.
 - When modifying shared code (stores, IPC handlers, types), trace all consumers to ensure nothing breaks.
 
 ## Logging
@@ -31,3 +32,10 @@
 - Our status line implementation is superior to external alternatives (e.g., ccstatusline). Do not replace it.
 - 13 configurable items with custom colors, zone alignment, and template-based config.
 - Usage polling: Chrome session key (primary, lenient rate limits) → OAuth fallback (strict rate limits).
+
+## Native Modules (Electron)
+
+- `"npmRebuild": false` in `package.json` build config — electron-builder will NOT rebuild native modules.
+- Only use packages with Electron-specific prebuilts (e.g., `@lydell/node-pty`) or pure-WASM/pure-JS libs.
+- **Never add native modules** (compiled `.node` files) as regular `dependencies` — they will fail at runtime with ABI mismatch (system Node.js ABI ≠ Electron ABI).
+- Current example: `sql.js` (WASM) used instead of `better-sqlite3` (native) for cookie DB queries.

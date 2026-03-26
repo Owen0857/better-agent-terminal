@@ -411,23 +411,21 @@ class WorkspaceStore {
   }
 
   appendScrollback(id: string, data: string): void {
-    this.state = {
-      ...this.state,
-      terminals: this.state.terminals.map(t =>
-        t.id === id ? { ...t, scrollbackBuffer: [...t.scrollbackBuffer, data] } : t
-      )
-    }
-    // Don't notify for scrollback updates to avoid re-renders
+    // Direct mutation — no notify() means React never reads this via subscription,
+    // so immutability provides no benefit; avoids O(n) spread on every PTY data event
+    const terminal = this.state.terminals.find(t => t.id === id)
+    if (terminal) terminal.scrollbackBuffer.push(data)
   }
 
   clearScrollback(id: string): void {
+    // Immutable update + notify: clears the buffer AND triggers re-render so UI reflects empty state.
+    // Must replace the array reference so any component reading scrollbackBuffer sees the change.
     this.state = {
       ...this.state,
       terminals: this.state.terminals.map(t =>
         t.id === id ? { ...t, scrollbackBuffer: [] } : t
       )
     }
-
     this.notify()
   }
 

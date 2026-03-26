@@ -1,5 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, powerMonitor, clipboard, nativeImage } from 'electron'
 import path from 'path'
+import os from 'os'
+import crypto from 'crypto'
 import * as fs from 'fs/promises'
 import * as fsSync from 'fs'
 import { execFileSync } from 'child_process'
@@ -531,6 +533,9 @@ function registerProxiedHandlers() {
   let _sessionKeyCacheTime = 0
   const TOKEN_CACHE_TTL = 10 * 60 * 1000     // 10 minutes
   const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000 // 30 minutes
+  let _chromeWinMasterKey: Buffer | null = null // Windows only: AES-256 key from Chrome Local State
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let _sqlJsInstance: any | null = null        // Windows only: cached sql.js WASM instance
 
   async function getOAuthToken(): Promise<string | null> {
     const now = Date.now()
@@ -566,11 +571,10 @@ function registerProxiedHandlers() {
   /** Decrypt a Chrome v10 encrypted cookie value on macOS */
   function decryptChromeCookie(encHex: string, derivedKey: Buffer): string | null {
     try {
-      const crypto = require('crypto')
       const encBuf = Buffer.from(encHex, 'hex')
       if (encBuf.length < 4 || encBuf.toString('utf-8', 0, 3) !== 'v10') return null
       const ciphertext = encBuf.subarray(3)
-      const iv = Buffer.alloc(16, 0x20) // 16 space characters
+      const iv = Buffer.alloc(16, 0x20) // 16 space characters — Chrome's fixed IV for AES-128-CBC
       const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv)
       let dec = decipher.update(ciphertext)
       dec = Buffer.concat([dec, decipher.final()])
@@ -579,27 +583,23 @@ function registerProxiedHandlers() {
   }
 
   /** Extract session key and cf_clearance from Chrome cookies on macOS */
-  async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+  async function getSessionKeyFromChromeMac(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
     if (process.platform !== 'darwin') return null
     const now = Date.now()
     if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
       return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
     }
     try {
-      const crypto = await import('crypto')
       const { execSync } = await import('child_process')
-      const os = await import('os')
 
       // Copy Chrome cookies DB to temp to avoid WAL lock
       const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
-      try { await fs.access(chromeCookiePath) } catch { return null }
-
-      const tmpDir = os.tmpdir()
-      const tmpDb = path.join(tmpDir, 'bat-chrome-cookies.db')
+      const tmpDb = path.join(os.tmpdir(), `bat-chrome-${crypto.randomBytes(4).toString('hex')}.db`)
       await fs.copyFile(chromeCookiePath, tmpDb)
-      // Also copy WAL and SHM files for consistency
-      try { await fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal') } catch { /* ok */ }
-      try { await fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm') } catch { /* ok */ }
+      await Promise.allSettled([
+        fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal'),
+        fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm'),
+      ])
 
       // Get Chrome safe storage password from Keychain
       const chromePassword = execSync(
@@ -616,10 +616,11 @@ function registerProxiedHandlers() {
         { encoding: 'utf-8', timeout: 5000 }
       ).trim()
 
-      // Clean up temp files
-      try { await fs.unlink(tmpDb) } catch { /* ok */ }
-      try { await fs.unlink(tmpDb + '-wal') } catch { /* ok */ }
-      try { await fs.unlink(tmpDb + '-shm') } catch { /* ok */ }
+      await Promise.allSettled([
+        fs.unlink(tmpDb),
+        fs.unlink(tmpDb + '-wal'),
+        fs.unlink(tmpDb + '-shm'),
+      ])
 
       if (!rawOutput) return null
 
@@ -654,6 +655,150 @@ function registerProxiedHandlers() {
       logger.error('[usage] Failed to extract Chrome session key:', e)
       return null
     }
+  }
+
+  function getLocalAppData(): string {
+    return process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
+  }
+
+  /** DPAPI decrypt via PowerShell (async, non-blocking) — returns decrypted Buffer or null */
+  async function dpapiDecrypt(hexData: string): Promise<Buffer | null> {
+    if (!/^[0-9A-Fa-f]+$/.test(hexData) || hexData.length === 0 || hexData.length % 2 !== 0) return null
+    // hex is validated to [0-9A-Fa-f] — no injection risk embedding inline
+    const script =
+      `Add-Type -AssemblyName System.Security;` +
+      `$b=[byte[]]-split('${hexData}'-replace'..','0x$& ');` +
+      `$p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser');` +
+      `($p|%{$_.ToString('x2')})-join''`
+    try {
+      const { stdout } = await execFileAsync('powershell', [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script
+      ], { encoding: 'utf-8', timeout: 10000 })
+      const hex = stdout.trim()
+      if (!hex || !/^[0-9a-f]+$/.test(hex)) return null
+      return Buffer.from(hex, 'hex')
+    } catch { return null }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const execFileAsync: (file: string, args: string[], options: object) => Promise<{ stdout: string }> =
+    require('util').promisify(require('child_process').execFile)
+
+  /** Read AES-256 master key from Chrome Local State and DPAPI-decrypt it */
+  async function getChromeWinMasterKey(): Promise<Buffer | null> {
+    if (_chromeWinMasterKey) return _chromeWinMasterKey
+    try {
+      const localStatePath = path.join(getLocalAppData(), 'Google', 'Chrome', 'User Data', 'Local State')
+      const raw = await fs.readFile(localStatePath, 'utf-8')
+      const localState = JSON.parse(raw)
+      const encKeyB64: string | undefined = localState?.os_crypt?.encrypted_key
+      if (!encKeyB64) return null
+      const encKeyWithPrefix = Buffer.from(encKeyB64, 'base64')
+      // Chrome prepends "DPAPI" before storing the DPAPI-encrypted key in Local State
+      // so the payload doesn't look like arbitrary binary to policy scanners
+      if (encKeyWithPrefix.subarray(0, 5).toString('ascii') !== 'DPAPI') return null
+      const masterKey = await dpapiDecrypt(encKeyWithPrefix.subarray(5).toString('hex'))
+      if (!masterKey || masterKey.length !== 32) return null
+      _chromeWinMasterKey = masterKey
+      return masterKey
+    } catch { return null }
+  }
+
+  /** Decrypt AES-256-GCM (Scheme B / v10) Chrome cookie value on Windows */
+  function decryptChromeWinSchemeB(encBuf: Buffer, masterKey: Buffer): string | null {
+    try {
+      // Chromium "Scheme B" layout (Chromium 80+, os_crypt_win.cc):
+      // [v10 magic (3)] [GCM nonce (12)] [ciphertext] [GCM auth tag (16)]
+      if (encBuf.length < 3 + 12 + 1 + 16) return null
+      if (encBuf[0] !== 0x76 || encBuf[1] !== 0x31 || encBuf[2] !== 0x30) return null
+      const nonce = encBuf.subarray(3, 15)
+      const tag = encBuf.subarray(encBuf.length - 16)
+      const ciphertext = encBuf.subarray(15, encBuf.length - 16)
+      const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, nonce)
+      decipher.setAuthTag(tag)
+      const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+      return dec.toString('utf-8').replace(/[^\x20-\x7E]/g, '').trim()
+    } catch { return null }
+  }
+
+  /** Extract session key and cf_clearance from Chrome cookies on Windows */
+  async function getSessionKeyFromChromeWin(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
+    }
+    try {
+      const cookiePath = path.join(getLocalAppData(), 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies')
+      const masterKey = await getChromeWinMasterKey()
+      if (!masterKey) return null
+
+      const tmpDb = path.join(os.tmpdir(), `bat-chrome-${crypto.randomBytes(4).toString('hex')}.db`)
+      await fs.copyFile(cookiePath, tmpDb)
+      await Promise.allSettled([
+        fs.copyFile(cookiePath + '-wal', tmpDb + '-wal'),
+        fs.copyFile(cookiePath + '-shm', tmpDb + '-shm'),
+      ])
+
+      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
+      try {
+        // sql.js is pure WASM — no native module, no Electron ABI issues
+        // reuse cached instance to avoid re-compiling WASM on every call
+        if (!_sqlJsInstance) {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          _sqlJsInstance = await require('sql.js')()
+        }
+        const fileBuffer = await fs.readFile(tmpDb)
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+        const db = new _sqlJsInstance.Database(fileBuffer)
+        try {
+          const result = db.exec(
+            `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
+          )
+          rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
+            name,
+            encrypted_value: Buffer.from(encVal)
+          }))
+        } finally {
+          db.close()
+        }
+      } finally {
+        await Promise.allSettled([
+          fs.unlink(tmpDb),
+          fs.unlink(tmpDb + '-wal'),
+          fs.unlink(tmpDb + '-shm'),
+        ])
+      }
+
+      let sessionKey: string | null = null
+      let cfClearance: string | null = null
+      for (const row of rows) {
+        const decrypted = decryptChromeWinSchemeB(row.encrypted_value, masterKey)
+        if (!decrypted) continue
+        if (row.name === 'sessionKey') {
+          const idx = decrypted.indexOf('sk-ant-sid')
+          sessionKey = idx >= 0 ? decrypted.substring(idx) : decrypted
+        } else if (row.name === 'cf_clearance') {
+          cfClearance = decrypted
+        }
+      }
+
+      if (!sessionKey || sessionKey.length < 10) return null
+      _cachedSessionKey = sessionKey
+      _cachedCfClearance = cfClearance
+      _sessionKeyCacheTime = now
+      logger.log('[usage] Extracted session key from Chrome/Win (length:', sessionKey.length, ')')
+      return { sessionKey, cfClearance }
+    } catch (e) {
+      logger.error('[usage] Failed to extract Chrome/Win session key:', e)
+      return null
+    }
+  }
+
+  /** Dispatch to platform-specific Chrome session key extraction */
+  async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    if (process.platform === 'darwin') return getSessionKeyFromChromeMac()
+    if (process.platform === 'win32') return getSessionKeyFromChromeWin()
+    return null
   }
 
   /** Auto-detect organization ID using session key */
@@ -711,6 +856,8 @@ function registerProxiedHandlers() {
       _cachedOrgId = null
       _cachedCfClearance = null
       _sessionKeyCacheTime = 0
+      // master key may have rotated — force re-read from Local State on next attempt
+      _chromeWinMasterKey = null
       logger.log('[usage] Session key expired or blocked, will re-extract')
       return null
     }
