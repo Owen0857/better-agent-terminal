@@ -19,22 +19,62 @@ class WorkspaceStore {
   private listeners: Set<Listener> = new Set()
 
   // Global Claude usage (shared across all panels)
-  // Adaptive polling: backs off on rate limits, pauses when hidden, refreshes on focus
+  // Primary source: SDK rate_limit_event (fires on every query, persisted to localStorage)
+  // Fallback: adaptive polling (cold-start / no session history), backs off on rate limits
   private _claudeUsage: { fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null; fiveHourStale?: boolean } | null = null
   private _usageTimer: ReturnType<typeof setTimeout> | null = null
   private _usagePollingStarted = false
   private _usageInflight = false
-  private _usageBaseInterval = 120 * 1000            // 2 min normal (API has strict rate limits)
-  private _usageCurrentInterval = 120 * 1000
-  private _usageMaxInterval = 30 * 60 * 1000       // 30 min max backoff
-  private _usageMinInterval = 60 * 1000             // 1 min min (after activity)
-  private _usageRateLimitMin = 120 * 1000           // 2 min min when rate limited
+  private _usageBaseInterval = 10 * 60 * 1000       // 10 min idle (SDK events are primary source)
+  private _usageCurrentInterval = 10 * 60 * 1000
+  private _usageMaxInterval = 30 * 60 * 1000        // 30 min max backoff
+  private _usageMinInterval = 60 * 1000              // 1 min min (after activity)
   private _visibilityHandler: (() => void) | null = null
   // One-shot timer: starts on first failure, cancelled on success, fires once to mark stale
   private _fiveHourStaleTimer: ReturnType<typeof setTimeout> | null = null
   private static readonly _FIVE_HOUR_STALE_MS = 10 * 60 * 1000  // 10 min without data → show --%
+  private static readonly _USAGE_CACHE_KEY = 'bat_claude_usage_cache'
 
   get claudeUsage() { return this._claudeUsage }
+
+  /** Persist current usage to localStorage so it survives app restarts */
+  private _persistUsage() {
+    if (!this._claudeUsage) return
+    try {
+      const { fiveHourStale: _, ...data } = this._claudeUsage
+      localStorage.setItem(WorkspaceStore._USAGE_CACHE_KEY, JSON.stringify({
+        ...data,
+        savedAt: new Date().toISOString(),
+      }))
+    } catch { /* quota exceeded or unavailable — non-fatal */ }
+  }
+
+  /** Restore persisted usage on startup; clears components whose resetsAt has already passed */
+  private _loadPersistedUsage() {
+    try {
+      const raw = localStorage.getItem(WorkspaceStore._USAGE_CACHE_KEY)
+      if (!raw) return
+      const cached = JSON.parse(raw) as {
+        fiveHour: number | null; sevenDay: number | null
+        fiveHourReset: string | null; sevenDayReset: string | null
+        savedAt?: string
+      }
+      const now = Date.now()
+      const fiveResetMs = cached.fiveHourReset ? new Date(cached.fiveHourReset).getTime() : null
+      const sevenResetMs = cached.sevenDayReset ? new Date(cached.sevenDayReset).getTime() : null
+      // If the reset time has already passed, the limit has rolled over — clear that slot
+      const fiveExpired = fiveResetMs !== null && now > fiveResetMs
+      const sevenExpired = sevenResetMs !== null && now > sevenResetMs
+      this._claudeUsage = {
+        fiveHour:      fiveExpired  ? null : cached.fiveHour,
+        fiveHourReset: fiveExpired  ? null : cached.fiveHourReset,
+        sevenDay:      sevenExpired ? null : cached.sevenDay,
+        sevenDayReset: sevenExpired ? null : cached.sevenDayReset,
+        fiveHourStale: (now - (cached.savedAt ? new Date(cached.savedAt).getTime() : 0)) > WorkspaceStore._FIVE_HOUR_STALE_MS,
+      }
+      this.notify()
+    } catch { /* corrupt cache — ignore, polling will populate fresh data */ }
+  }
 
   private _clearFiveHourStaleTimer() {
     if (this._fiveHourStaleTimer) {
@@ -43,10 +83,21 @@ class WorkspaceStore {
     }
   }
 
-  /** Start the stale timer only if not already running and not already stale */
+  /** Start the stale timer only if not already running and not already stale.
+   *  If the current poll interval already exceeds the stale threshold (e.g. 30min backoff or
+   *  server-directed rate limit), mark stale immediately — waiting 10min would show stale data
+   *  as fresh during a window where we know no poll is coming. */
   private _startFiveHourStaleTimerIfNeeded() {
     if (this._fiveHourStaleTimer !== null) return   // timer already running — don't reset
     if (this._claudeUsage?.fiveHourStale) return    // already stale — nothing to do
+    if (this._usageCurrentInterval > WorkspaceStore._FIVE_HOUR_STALE_MS) {
+      // Next poll is further away than the stale window — no point waiting for the timer
+      const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+      this._claudeUsage = { ...prev, fiveHourStale: true }
+      window.electronAPI.debug.log(`[usage:poll] 5h stale immediately — next poll in ${this._usageCurrentInterval / 60000}min`)
+      this.notify()
+      return
+    }
     this._fiveHourStaleTimer = setTimeout(() => {
       this._fiveHourStaleTimer = null
       const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
@@ -79,10 +130,20 @@ class WorkspaceStore {
       }
 
       // Success — cancel stale timer, clear stale flag, reset poll interval
+      // Merge with existing state: prefer poll values, fall back to prior SDK event values for null fields
       this._clearFiveHourStaleTimer()
       this._usageCurrentInterval = this._usageBaseInterval
-      window.electronAPI.debug.log(`[usage:poll] OK 5h=${(u as any).fiveHour} 7d=${(u as any).sevenDay} 5hReset=${(u as any).fiveHourReset} 7dReset=${(u as any).sevenDayReset}`)
-      this._claudeUsage = { ...(u as any), fiveHourStale: false }
+      const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+      const polled = u as any
+      window.electronAPI.debug.log(`[usage:poll] OK 5h=${polled.fiveHour} 7d=${polled.sevenDay} 5hReset=${polled.fiveHourReset} 7dReset=${polled.sevenDayReset}`)
+      this._claudeUsage = {
+        fiveHour:      polled.fiveHour      ?? prev.fiveHour,
+        sevenDay:      polled.sevenDay      ?? prev.sevenDay,
+        fiveHourReset: polled.fiveHourReset ?? prev.fiveHourReset,
+        sevenDayReset: polled.sevenDayReset ?? prev.sevenDayReset,
+        fiveHourStale: false,
+      }
+      this._persistUsage()
       this.notify()
     } catch {
       // Network error — double the interval (exponential backoff)
@@ -94,6 +155,7 @@ class WorkspaceStore {
   }
 
   private _scheduleNextPoll() {
+    if (!this._usagePollingStarted) return
     if (this._usageTimer) clearTimeout(this._usageTimer)
     this._usageTimer = setTimeout(async () => {
       await this._fetchUsage()
@@ -104,6 +166,9 @@ class WorkspaceStore {
   startUsagePolling() {
     if (this._usagePollingStarted) return
     this._usagePollingStarted = true
+
+    // Restore last known values immediately so UI isn't blank on startup
+    this._loadPersistedUsage()
 
     // Initial fetch
     this._fetchUsage().then(() => this._scheduleNextPoll())
@@ -134,15 +199,29 @@ class WorkspaceStore {
     } else if (info.rateLimitType === 'seven_day' || info.rateLimitType === 'seven_day_opus' || info.rateLimitType === 'seven_day_sonnet') {
       this._claudeUsage = { ...prev, sevenDay: info.utilization, sevenDayReset: resetIso }
     }
+    this._persistUsage()
     this.notify()
   }
 
   /** Call after agent activity (turn completed, session ended) for a timely refresh */
   refreshUsageNow() {
     if (!this._usagePollingStarted) return
-    // Use shorter interval temporarily after activity
-    this._usageCurrentInterval = this._usageMinInterval
+    // Shorten interval only if we are currently waiting longer than the min — preserves backoff if already throttled
+    if (this._usageCurrentInterval <= this._usageBaseInterval) {
+      this._usageCurrentInterval = this._usageMinInterval
+    }
     this._fetchUsage().then(() => this._scheduleNextPoll())
+  }
+
+  /** Release all polling resources (timers + event listeners) */
+  stopUsagePolling() {
+    if (this._usageTimer) { clearTimeout(this._usageTimer); this._usageTimer = null }
+    this._clearFiveHourStaleTimer()
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler)
+      this._visibilityHandler = null
+    }
+    this._usagePollingStarted = false
   }
 
   getState(): AppState {

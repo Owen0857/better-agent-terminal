@@ -817,6 +817,14 @@ function registerProxiedHandlers() {
       })
       if (!res.ok) {
         logger.error('[usage] Organizations API returned', res.status)
+        if (res.status === 401 || res.status === 403) {
+          // Session key is invalid — clear all session caches so next poll re-extracts
+          _cachedSessionKey = null
+          _cachedCfClearance = null
+          _sessionKeyCacheTime = 0
+          _chromeWinMasterKey = null
+          logger.log('[usage] org auth error', res.status, '— cleared session caches')
+        }
         return null
       }
       const orgs = await res.json()
