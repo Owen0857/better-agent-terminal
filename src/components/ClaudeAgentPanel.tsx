@@ -33,6 +33,7 @@ interface SessionMeta {
   numTurns: number
   contextWindow: number
   maxOutputTokens: number
+  contextTokens: number
   permissionMode?: string
 }
 
@@ -918,12 +919,20 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
 
   const clearInput = useCallback(() => {
     inputValueRef.current = ''
-    if (textareaRef.current) textareaRef.current.value = ''
+    if (textareaRef.current) {
+      textareaRef.current.value = ''
+      textareaRef.current.style.height = 'auto'
+    }
   }, [])
 
   const setInputValue = useCallback((val: string) => {
     inputValueRef.current = val
-    if (textareaRef.current) textareaRef.current.value = val
+    if (textareaRef.current) {
+      textareaRef.current.value = val
+      // Auto-resize after setting value
+      textareaRef.current.style.height = 'auto'
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + 'px'
+    }
   }, [])
 
   // Listen for skill insertion from SkillsPanel
@@ -1085,9 +1094,18 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     return q ? all.filter(c => c.name.toLowerCase().includes(q)) : all
   }, [showSlashMenu, slashFilter, slashCommands])
 
+  // Auto-resize textarea to fit content
+  const autoResizeTextarea = useCallback(() => {
+    const ta = textareaRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
+  }, [])
+
   const handleInputChange = useCallback((e: React.FormEvent<HTMLTextAreaElement>) => {
     const val = (e.target as HTMLTextAreaElement).value
     inputValueRef.current = val
+    autoResizeTextarea()
     // Show slash command menu when typing / at the start
     if (val.startsWith('/') && !val.includes(' ')) {
       setShowSlashMenu(true)
@@ -2883,11 +2901,16 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
           duration: () => !sessionMeta || sessionMeta.durationMs <= 0 ? null : (
             <span key="duration" className="claude-statusline-item">{(sessionMeta.durationMs / 1000).toFixed(1)}s</span>
           ),
-          contextPct: () => !sessionMeta || sessionMeta.contextWindow <= 0 ? null : (
-            <span key="contextPct" className="claude-statusline-item" title={`${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens`}>
-              ctx {Math.round(((sessionMeta.inputTokens + sessionMeta.outputTokens) / sessionMeta.contextWindow) * 100)}%
-            </span>
-          ),
+          contextPct: () => {
+            if (!sessionMeta || sessionMeta.contextWindow <= 0) return null
+            const ctxTokens = sessionMeta.contextTokens || (sessionMeta.inputTokens + sessionMeta.outputTokens)
+            const pct = Math.round((ctxTokens / sessionMeta.contextWindow) * 100)
+            return (
+              <span key="contextPct" className="claude-statusline-item" title={`context: ${ctxTokens.toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens\ntotal: ${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} tok`}>
+                ctx {pct}%
+              </span>
+            )
+          },
           cost: () => !sessionMeta || sessionMeta.totalCost <= 0 ? null : (
             <span key="cost" className="claude-statusline-item">${sessionMeta.totalCost.toFixed(4)}</span>
           ),

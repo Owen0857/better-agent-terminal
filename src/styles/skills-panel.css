@@ -175,8 +175,8 @@
 
 .skills-item-name {
   font-size: 12px;
-  font-weight: 500;
-  color: var(--accent-color, #58a6ff);
+  font-weight: 600;
+  color: #e5a04b;
   font-family: monospace;
 }
 
