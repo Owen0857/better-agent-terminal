@@ -2948,7 +2948,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             )
             if (claudeUsage.fiveHour == null) return null
             return (
-              <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ''}`}>
+              <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ' claude-usage-low'}`}>
                 5h:{Math.round(claudeUsage.fiveHour)}%
               </span>
             )

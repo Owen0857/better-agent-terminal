@@ -1687,6 +1687,9 @@
   text-decoration: underline;
 }
 
+.claude-usage-low {
+  color: #98c379;
+}
 .claude-usage-mid {
   color: #e6a700;
 }
