@@ -2709,7 +2709,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <option value="high">high</option>
             </select>
             <span
-              className={`claude-status-btn${enable1MContext ? ' active' : ''}`}
+              className={`claude-1m-toggle${enable1MContext ? ' active' : ''}`}
               onClick={handle1MContextToggle}
               title={enable1MContext ? t('claude.1MContextEnabled') : t('claude.1MContextDisabled')}
             >
