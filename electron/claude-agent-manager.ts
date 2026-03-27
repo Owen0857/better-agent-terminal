@@ -92,6 +92,7 @@ interface SessionMetadata {
   numTurns: number
   contextWindow: number
   maxOutputTokens: number
+  contextTokens: number
 }
 
 interface PendingRequest {
@@ -294,6 +295,7 @@ export class ClaudeAgentManager {
           numTurns: 0,
           contextWindow: 0,
           maxOutputTokens: 0,
+          contextTokens: 0,
         },
         pendingPermissions: new Map(),
         pendingAskUser: new Map(),
@@ -972,6 +974,11 @@ export class ClaudeAgentManager {
             logger.log(line)
             session.metadata.inputTokens = totalInput
             session.metadata.outputTokens = usageFull.output_tokens || 0
+          }
+
+          // Per-turn usage.input_tokens reflects actual current context size
+          if (resultMsg.usage?.input_tokens) {
+            session.metadata.contextTokens = resultMsg.usage.input_tokens
           }
 
           this.send('claude:status', sessionId, { ...session.metadata })
