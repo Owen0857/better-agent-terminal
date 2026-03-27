@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18next from 'i18next'
 import { workspaceStore } from './stores/workspace-store'
@@ -77,6 +77,8 @@ export default function App() {
   })
   // Markdown preview in right panel
   const [previewMarkdownPath, setPreviewMarkdownPath] = useState<string | null>(null)
+  // Track collapsed state before markdown preview opened, to restore on close
+  const previewPrevCollapsed = useRef<boolean | null>(null)
   // Panel settings for resizable panels
   const [panelSettings, setPanelSettings] = useState<PanelSettings>(loadPanelSettings)
   // Detached workspace support
@@ -165,8 +167,9 @@ export default function App() {
     const handler = (e: Event) => {
       const { path } = (e as CustomEvent).detail as { path: string }
       setPreviewMarkdownPath(path)
-      // Expand right panel if collapsed
+      // Save current collapsed state so we can restore it on close, then expand panel
       setPanelSettings(prev => {
+        previewPrevCollapsed.current = prev.snippetSidebar.collapsed
         if (prev.snippetSidebar.collapsed) {
           const updated = { ...prev, snippetSidebar: { ...prev.snippetSidebar, collapsed: false } }
           savePanelSettings(updated)
@@ -559,7 +562,21 @@ export default function App() {
             <div className="right-sidebar-wrapper" style={{ width: `${panelSettings.snippetSidebar.width}px`, minWidth: `${panelSettings.snippetSidebar.width}px`, display: 'flex', flexDirection: 'column' }}>
               <MarkdownPreviewPanel
                 filePath={previewMarkdownPath}
-                onClose={() => setPreviewMarkdownPath(null)}
+                onClose={() => {
+                  setPreviewMarkdownPath(null)
+                  // Restore panel collapsed state from before the preview opened
+                  if (previewPrevCollapsed.current !== null) {
+                    const wasCollapsed = previewPrevCollapsed.current
+                    previewPrevCollapsed.current = null
+                    if (wasCollapsed) {
+                      setPanelSettings(prev => {
+                        const updated = { ...prev, snippetSidebar: { ...prev.snippetSidebar, collapsed: true } }
+                        savePanelSettings(updated)
+                        return updated
+                      })
+                    }
+                  }
+                }}
               />
             </div>
           )
