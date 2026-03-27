@@ -9,6 +9,7 @@
     "compile": "vite build",
     "start": "electron .",
     "build": "vite build && electron-builder",
+    "build:dir": "vite build && electron-builder --dir",
     "build:release": "node scripts/build-version.js",
     "postinstall": "node -e \"if(process.platform==='darwin'){const p=require('path').join('node_modules/electron/dist/Electron.app/Contents/Info.plist');try{require('child_process').execSync('plutil -replace CFBundleName -string BetterAgentTerminal '+p+' && plutil -replace CFBundleDisplayName -string BetterAgentTerminal '+p)}catch(e){}}\" && echo 'postinstall done'",
     "test:console": "node tests/console-test.js",
