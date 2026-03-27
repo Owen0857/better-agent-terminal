@@ -16,9 +16,14 @@ export function MarkdownPreviewPanel({ filePath, onClose }: MarkdownPreviewPanel
   const fileName = filePath.split(/[/\\]/).pop() || filePath
 
   const loadContent = useCallback(() => {
-    window.electronAPI.fs.readFile(filePath).then(text => {
-      setContent(text)
-      setError(null)
+    window.electronAPI.fs.readFile(filePath).then(result => {
+      if (result.error) {
+        setError(result.error)
+        setContent(null)
+      } else {
+        setContent(result.content ?? '')
+        setError(null)
+      }
     }).catch(err => {
       setError(String(err))
       setContent(null)
