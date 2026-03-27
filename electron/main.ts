@@ -568,10 +568,9 @@ function registerProxiedHandlers() {
     } catch { return null }
   }
 
-  /** Decrypt a Chrome v10 encrypted cookie value on macOS */
-  function decryptChromeCookie(encHex: string, derivedKey: Buffer): string | null {
+  /** Decrypt a Chrome v10 AES-128-CBC cookie value on macOS */
+  function decryptChromeCookieMac(encBuf: Buffer, derivedKey: Buffer): string | null {
     try {
-      const encBuf = Buffer.from(encHex, 'hex')
       if (encBuf.length < 4 || encBuf.toString('utf-8', 0, 3) !== 'v10') return null
       const ciphertext = encBuf.subarray(3)
       const iv = Buffer.alloc(16, 0x20) // 16 space characters — Chrome's fixed IV for AES-128-CBC
@@ -582,7 +581,7 @@ function registerProxiedHandlers() {
     } catch { return null }
   }
 
-  /** Extract session key and cf_clearance from Chrome cookies on macOS */
+  /** Extract session key and cf_clearance from Chrome cookies on macOS (sql.js — no sqlite3 CLI dep) */
   async function getSessionKeyFromChromeMac(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
     if (process.platform !== 'darwin') return null
     const now = Date.now()
@@ -591,15 +590,6 @@ function registerProxiedHandlers() {
     }
     try {
       const { execSync } = await import('child_process')
-
-      // Copy Chrome cookies DB to temp to avoid WAL lock
-      const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
-      const tmpDb = path.join(os.tmpdir(), `bat-chrome-${crypto.randomBytes(4).toString('hex')}.db`)
-      await fs.copyFile(chromeCookiePath, tmpDb)
-      await Promise.allSettled([
-        fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal'),
-        fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm'),
-      ])
 
       // Get Chrome safe storage password from Keychain
       const chromePassword = execSync(
@@ -610,36 +600,57 @@ function registerProxiedHandlers() {
 
       const derivedKey = crypto.pbkdf2Sync(chromePassword, 'saltysalt', 1003, 16, 'sha1')
 
-      // Query sessionKey and cf_clearance
-      const rawOutput = execSync(
-        `sqlite3 "${tmpDb}" "SELECT name, hex(encrypted_value) FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance');"`,
-        { encoding: 'utf-8', timeout: 5000 }
-      ).trim()
-
+      // Copy Chrome cookies DB to temp to avoid WAL lock
+      const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
+      const tmpDb = path.join(os.tmpdir(), `bat-chrome-${crypto.randomBytes(4).toString('hex')}.db`)
+      await fs.copyFile(chromeCookiePath, tmpDb)
       await Promise.allSettled([
-        fs.unlink(tmpDb),
-        fs.unlink(tmpDb + '-wal'),
-        fs.unlink(tmpDb + '-shm'),
+        fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal'),
+        fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm'),
       ])
 
-      if (!rawOutput) return null
+      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
+      try {
+        // sql.js is pure WASM — no sqlite3 CLI dependency, no Electron ABI issues
+        // reuse cached instance to avoid re-compiling WASM on every call
+        if (!_sqlJsInstance) {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          _sqlJsInstance = await require('sql.js')()
+        }
+        const fileBuffer = await fs.readFile(tmpDb)
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+        const db = new _sqlJsInstance.Database(fileBuffer)
+        try {
+          const result = db.exec(
+            `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
+          )
+          rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
+            name,
+            encrypted_value: Buffer.from(encVal)
+          }))
+        } finally {
+          db.close()
+        }
+      } finally {
+        await Promise.allSettled([
+          fs.unlink(tmpDb),
+          fs.unlink(tmpDb + '-wal'),
+          fs.unlink(tmpDb + '-shm'),
+        ])
+      }
 
       let sessionKey: string | null = null
       let cfClearance: string | null = null
 
-      for (const line of rawOutput.split('\n')) {
-        const [name, hex] = line.split('|')
-        if (!hex) continue
-        const decrypted = decryptChromeCookie(hex, derivedKey as unknown as Buffer)
+      for (const row of rows) {
+        const decrypted = decryptChromeCookieMac(row.encrypted_value, derivedKey)
         if (!decrypted) continue
-
-        // Strip non-ASCII chars from decrypted values
         const cleaned = decrypted.replace(/[^\x20-\x7E]/g, '').trim()
-        if (name === 'sessionKey') {
+        if (row.name === 'sessionKey') {
           // Decrypted value may have garbage prefix; extract from sk-ant-sid
           const idx = cleaned.indexOf('sk-ant-sid')
           sessionKey = idx >= 0 ? cleaned.substring(idx) : cleaned
-        } else if (name === 'cf_clearance') {
+        } else if (row.name === 'cf_clearance') {
           cfClearance = cleaned
         }
       }
@@ -794,6 +805,14 @@ function registerProxiedHandlers() {
     }
   }
 
+  /** Chrome User-Agent matching the platform where the cookie was issued */
+  function getChromeUserAgent(): string {
+    if (process.platform === 'win32') {
+      return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  }
+
   /** Dispatch to platform-specific Chrome session key extraction */
   async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
     if (process.platform === 'darwin') return getSessionKeyFromChromeMac()
@@ -811,7 +830,7 @@ function registerProxiedHandlers() {
       const res = await fetch('https://claude.ai/api/organizations', {
         headers: {
           'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'User-Agent': getChromeUserAgent(),
           'Cookie': cookieParts.join('; '),
         },
       })
@@ -854,7 +873,7 @@ function registerProxiedHandlers() {
     const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
       headers: {
         'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'User-Agent': getChromeUserAgent(),
         'Cookie': cookieParts.join('; '),
       },
     })
