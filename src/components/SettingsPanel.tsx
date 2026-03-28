@@ -312,18 +312,6 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
               <p className="settings-hint">{t('settings.allowBypassPermissionsHint')}</p>
             </div>
 
-            <div className="settings-group checkbox-group">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={settings.enable1MContext !== false}
-                  onChange={e => settingsStore.setEnable1MContext(e.target.checked)}
-                />
-                {t('settings.enable1MContext')}
-              </label>
-              <p className="settings-hint">{t('settings.enable1MContextHint')}</p>
-            </div>
-
             <div className="settings-group">
               <label>{t('settings.defaultModel')}</label>
               <input

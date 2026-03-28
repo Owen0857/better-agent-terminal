@@ -129,7 +129,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   const [permissionMode, setPermissionMode] = useState<string>('bypassPermissions')
   const [currentModel, setCurrentModel] = useState<string>('')
   const [effortLevel, setEffortLevel] = useState<string>('medium')
-  const [enable1MContext, setEnable1MContext] = useState(false)
   const [claudeUsage, setClaudeUsage] = useState(workspaceStore.claudeUsage)
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([])
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null)
@@ -749,7 +748,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         historyLoadedRef.current = true
         window.electronAPI.claude.resumeSession(sessionId, savedSdkSessionId, cwd, savedModel)
       } else {
-        dlog(`${stag} FRESH startSession`)
+        dlog(`${stag} FRESH startSession model=${effectiveModel || 'SDK-default'}`)
         window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode, model: effectiveModel, effort: effectiveEffort as 'low' | 'medium' | 'high' | 'max' })
       }
     }
@@ -776,7 +775,18 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       window.electronAPI.claude.getSupportedModels(sessionId).then((models: ModelInfo[]) => {
         console.log('[getSupportedModels] raw response:', JSON.stringify(models, null, 2))
         if (models && models.length > 0) {
-          setAvailableModels(models)
+          // Inject [1m] variants for models that support 1M context
+          const withExtras = [...models]
+          const opusEntry = models.find(m => m.value === 'claude-opus-4-6')
+          if (opusEntry && !models.some(m => m.value === 'claude-opus-4-6[1m]')) {
+            const idx = models.indexOf(opusEntry)
+            withExtras.splice(idx + 1, 0, {
+              value: 'claude-opus-4-6[1m]',
+              displayName: 'Claude Opus 4.6 [1M]',
+              description: 'Opus 4.6 with 1M token context window',
+            })
+          }
+          setAvailableModels(withExtras)
         }
       }).catch(() => {})
       window.electronAPI.claude.getAccountInfo(sessionId).then(info => {
@@ -811,6 +821,14 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     return workspaceStore.subscribe(() => {
       const u = workspaceStore.claudeUsage
       if (u) setClaudeUsage(u)
+    })
+  }, [])
+
+  // Update usage from SDK rate_limit_event (no polling needed, fires on every query)
+  useEffect(() => {
+    return window.electronAPI.claude.onUsageUpdate((info) => {
+      window.electronAPI.debug.log(`[usage:rate_limit_event] type=${info.rateLimitType} util=${info.utilization} resetsAt=${info.resetsAt ?? 'none'}`)
+      workspaceStore.applyRateLimitEvent(info)
     })
   }, [])
 
@@ -1161,6 +1179,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     if (e.key === 'ArrowUp' && !e.shiftKey && !e.nativeEvent.isComposing) {
       const history = inputHistoryRef.current
       if (history.length === 0) return
+      // In multi-line input, only navigate history when cursor is on the first line
+      const ta = e.currentTarget as HTMLTextAreaElement
+      const firstNewline = ta.value.indexOf('\n')
+      const isOnFirstLine = firstNewline === -1 || ta.selectionStart <= firstNewline
+      if (!isOnFirstLine) return
       e.preventDefault()
       if (inputHistoryIndexRef.current === -1) {
         inputDraftRef.current = inputValueRef.current
@@ -1173,6 +1196,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     }
     if (e.key === 'ArrowDown' && !e.shiftKey && !e.nativeEvent.isComposing) {
       if (inputHistoryIndexRef.current === -1) return
+      // In multi-line input, only navigate history when cursor is on the last line
+      const ta = e.currentTarget as HTMLTextAreaElement
+      const lastNewline = ta.value.lastIndexOf('\n')
+      const isOnLastLine = lastNewline === -1 || ta.selectionStart > lastNewline
+      if (!isOnLastLine) return
       e.preventDefault()
       const history = inputHistoryRef.current
       if (inputHistoryIndexRef.current < history.length - 1) {
@@ -1204,13 +1232,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     setEffortLevel(next)
     await window.electronAPI.claude.setEffort(sessionId, next)
   }, [sessionId])
-
-  const handle1MContextToggle = useCallback(async () => {
-    const next = !enable1MContext
-    setEnable1MContext(next)
-    settingsStore.setEnable1MContext(next)
-    await window.electronAPI.claude.set1MContext(sessionId, next)
-  }, [sessionId, enable1MContext])
 
   const showDontAskAgain = (pendingPermission?.suggestions?.length ?? 0) > 0
     || pendingPermission?.toolName === 'ExitPlanMode'
@@ -2061,8 +2082,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               {item.result && (() => {
                 const raw = typeof item.result === 'string' ? item.result : String(item.result)
                 const { content: outText, reminders, errors } = splitSystemReminders(raw)
-                // Hide output by default for read-only tools (Read, Glob, Grep, LS, NotebookRead)
-                const isReadOnlyTool = ['Read', 'Glob', 'Grep', 'LS', 'NotebookRead'].includes(item.toolName)
+                // All tool outputs collapsed by default — click to expand
                 const isOutExpanded = expandedTools.has(outBlockId)
                 return (
                   <>
@@ -2072,7 +2092,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                         <span className="claude-tool-row-content">{err}</span>
                       </div>
                     ))}
-                    {outText && isReadOnlyTool && (
+                    {outText && (
                       <div
                         className="claude-tool-row"
                         onClick={() => toggleTool(outBlockId)}
@@ -2084,20 +2104,15 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
                             : <span className="claude-tool-collapsed-hint">{outText.split('\n').length} lines</span>
                           }
                         </span>
+                        {isOutExpanded && (
+                          <span
+                            className={`claude-tool-row-copy ${copiedId === outBlockId ? 'copied' : ''}`}
+                            onClick={(e) => { e.stopPropagation(); handleCopyBlock(outText, outBlockId) }}
+                          >
+                            {copiedId === outBlockId ? '✓' : '⧉'}
+                          </span>
+                        )}
                         <span className={`claude-tool-chevron ${isOutExpanded ? 'expanded' : ''}`}>&#9654;</span>
-                      </div>
-                    )}
-                    {outText && !isReadOnlyTool && (
-                      <div
-                        className="claude-tool-row"
-                        onClick={() => handleCopyBlock(outText, outBlockId)}
-                        title={t('claude.clickToCopy')}
-                      >
-                        <span className="claude-tool-row-label">{t('claude.out')}</span>
-                        <span className="claude-tool-row-content"><LinkedText text={outText} /></span>
-                        <span className={`claude-tool-row-copy ${copiedId === outBlockId ? 'copied' : ''}`}>
-                          {copiedId === outBlockId ? '✓' : '⧉'}
-                        </span>
                       </div>
                     )}
                     {reminders.length > 0 && (
@@ -2905,9 +2920,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             if (!sessionMeta || sessionMeta.contextWindow <= 0) return null
             const ctxTokens = sessionMeta.contextTokens || (sessionMeta.inputTokens + sessionMeta.outputTokens)
             const pct = Math.round((ctxTokens / sessionMeta.contextWindow) * 100)
+            const ctxColor = pct <= 50 ? '#98c379' : pct < 80 ? '#e5c07b' : '#e06c75'
+            const is1M = sessionMeta.contextWindow >= 1000000
             return (
-              <span key="contextPct" className="claude-statusline-item" title={`context: ${ctxTokens.toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens\ntotal: ${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} tok`}>
-                ctx {pct}%
+              <span key="contextPct" className="claude-statusline-item" style={{ color: ctxColor }} title={`context: ${ctxTokens.toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens\ntotal: ${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} tok`}>
+                ctx {pct}%{is1M && <span style={{ color: '#6cf', marginLeft: 3, fontWeight: 600 }}>1M</span>}
               </span>
             )
           },
@@ -2918,11 +2935,31 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             const ws = workspaceId ? workspaceStore.getState().workspaces.find(w => w.id === workspaceId) : null
             return ws ? <span key="workspace" className="claude-statusline-item">{ws.alias || ws.name}</span> : null
           },
-          usage5h: () => claudeUsage?.fiveHour == null ? null : (
-            <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ''}`}>
-              5h:{Math.round(claudeUsage.fiveHour)}%
-            </span>
-          ),
+          usage5h: () => {
+            if (!claudeUsage) return null
+            if (claudeUsage.fiveHourStale) return (
+              <span key="usage5h" className="claude-statusline-item claude-usage-stale">5h:--%</span>
+            )
+            if (claudeUsage.fiveHour == null) return null
+            const pacing = workspaceStore.getUsagePacing()
+            const paceIcon = pacing ? (pacing.onPace ? '▼' : '▲') : ''
+            const paceClass = pacing && !pacing.onPace ? ' claude-usage-overpace' : ''
+            let title = `5h utilization: ${claudeUsage.fiveHour.toFixed(1)}%`
+            if (pacing) {
+              title += `\nTime elapsed: ${pacing.timeElapsedPct.toFixed(0)}%`
+              title += pacing.onPace ? '\nOn pace ── usage within window budget' : '\nOver pace ── burning faster than replenish'
+              if (pacing.estimatedMinutesToLimit != null) {
+                const h = Math.floor(pacing.estimatedMinutesToLimit / 60)
+                const m = pacing.estimatedMinutesToLimit % 60
+                title += `\nEstimated limit in: ${h > 0 ? `${h}h${m}m` : `${m}m`}`
+              }
+            }
+            return (
+              <span key="usage5h" title={title} className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ' claude-usage-low'}${paceClass}`}>
+                5h:{Math.round(claudeUsage.fiveHour)}%{paceIcon}
+              </span>
+            )
+          },
           usage5hReset: () => {
             if (!claudeUsage?.fiveHourReset) return null
             return <span key="usage5hReset" className="claude-statusline-item">↻{fmtRemaining(new Date(claudeUsage.fiveHourReset))}</span>
@@ -2953,8 +2990,8 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
           for (const item of items) {
             let node = renderers[item.id]?.()
             if (!node) continue
-            // Apply color directly on the element via cloneElement to override class-based colors
-            if (item.color && isValidElement(node)) {
+            // Apply color from config, but don't override dynamic colors already set on the element
+            if (item.color && isValidElement(node) && !node.props.style?.color) {
               node = cloneElement(node, { style: { ...(node.props.style || {}), color: item.color } })
             }
             nodes.push(node)

@@ -26,7 +26,6 @@ const defaultSettings: AppSettings = {
   defaultTerminalCount: 1,
   createDefaultAgentTerminal: true,
   allowBypassPermissions: true,
-  enable1MContext: true
 }
 
 class SettingsStore {
@@ -182,12 +181,6 @@ class SettingsStore {
 
   setAllowBypassPermissions(allow: boolean): void {
     this.settings = { ...this.settings, allowBypassPermissions: allow }
-    this.notify()
-    this.save()
-  }
-
-  setEnable1MContext(enable: boolean): void {
-    this.settings = { ...this.settings, enable1MContext: enable }
     this.notify()
     this.save()
   }

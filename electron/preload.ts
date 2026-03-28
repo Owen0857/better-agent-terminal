@@ -115,14 +115,17 @@ const electronAPI = {
       ipcRenderer.on('claude:modeChange', handler)
       return () => ipcRenderer.removeListener('claude:modeChange', handler)
     },
+    onUsageUpdate: (callback: (info: { rateLimitType: string; utilization?: number; resetsAt?: number }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, info: { rateLimitType: string; utilization?: number; resetsAt?: number }) => callback(info)
+      ipcRenderer.on('claude:usage-update', handler)
+      return () => ipcRenderer.removeListener('claude:usage-update', handler)
+    },
     setPermissionMode: (sessionId: string, mode: string) =>
       ipcRenderer.invoke('claude:set-permission-mode', sessionId, mode),
     setModel: (sessionId: string, model: string) =>
       ipcRenderer.invoke('claude:set-model', sessionId, model),
     setEffort: (sessionId: string, effort: string) =>
       ipcRenderer.invoke('claude:set-effort', sessionId, effort),
-    set1MContext: (sessionId: string, enable: boolean) =>
-      ipcRenderer.invoke('claude:set-1m-context', sessionId, enable),
     resetSession: (sessionId: string) =>
       ipcRenderer.invoke('claude:reset-session', sessionId),
     getSupportedModels: (sessionId: string) =>

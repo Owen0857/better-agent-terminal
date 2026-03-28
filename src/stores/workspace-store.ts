@@ -19,49 +19,183 @@ class WorkspaceStore {
   private listeners: Set<Listener> = new Set()
 
   // Global Claude usage (shared across all panels)
-  // Adaptive polling: backs off on rate limits, pauses when hidden, refreshes on focus
-  private _claudeUsage: { fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null = null
+  // Primary source: SDK rate_limit_event (fires on every query, persisted to localStorage)
+  // Fallback: adaptive polling (cold-start / no session history), backs off on rate limits
+  private _claudeUsage: { fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null; fiveHourStale?: boolean; sevenDayStale?: boolean /* unused — 7d changes slowly, always show last known value */ } | null = null
   private _usageTimer: ReturnType<typeof setTimeout> | null = null
   private _usagePollingStarted = false
   private _usageInflight = false
-  private _usageBaseInterval = 120 * 1000            // 2 min normal (API has strict rate limits)
-  private _usageCurrentInterval = 120 * 1000
-  private _usageMaxInterval = 30 * 60 * 1000       // 30 min max backoff
-  private _usageMinInterval = 60 * 1000             // 1 min min (after activity)
-  private _usageRateLimitMin = 120 * 1000           // 2 min min when rate limited
+  private _usageRateLimited = false                  // true while in rate-limit backoff — blocks refreshUsageNow
+  private _usageRateLimitStreak = 0                 // consecutive 429s — drives cumulative backoff
+  private _usageBaseInterval = 10 * 60 * 1000       // 10 min idle (SDK events are primary source)
+  private _usageCurrentInterval = 10 * 60 * 1000
+  private _usageMaxInterval = 10 * 60 * 1000        // 10 min max backoff
+  private _usageMinInterval = 60 * 1000              // 1 min min (after activity)
   private _visibilityHandler: (() => void) | null = null
+  // One-shot timer: starts on first failure, cancelled on success, fires once to mark stale
+  private _fiveHourStaleTimer: ReturnType<typeof setTimeout> | null = null
+  private static readonly _FIVE_HOUR_STALE_MS = 10 * 60 * 1000  // 10 min without data → show --%
+  private static readonly _USAGE_CACHE_KEY = 'bat_claude_usage_cache'
 
   get claudeUsage() { return this._claudeUsage }
+
+  /** Pacing analysis for 5h window: compare utilization vs time elapsed percentage.
+   *  Returns null if data is insufficient. */
+  getUsagePacing(): { onPace: boolean; timeElapsedPct: number; estimatedMinutesToLimit: number | null } | null {
+    const u = this._claudeUsage
+    if (!u || u.fiveHour == null || !u.fiveHourReset) return null
+
+    const now = Date.now()
+    const resetMs = new Date(u.fiveHourReset).getTime()
+    const periodMs = 5 * 3600_000
+    const remainingMs = Math.max(0, resetMs - now)
+    const elapsedMs = periodMs - remainingMs
+    if (elapsedMs <= 0) return null
+
+    const timeElapsedPct = (elapsedMs / periodMs) * 100
+    const onPace = u.fiveHour <= timeElapsedPct
+
+    // Predict time to 100% based on current burn rate, capped to remaining window
+    let estimatedMinutesToLimit: number | null = null
+    if (u.fiveHour > 0) {
+      const ratePerMs = u.fiveHour / elapsedMs
+      const remaining = 100 - u.fiveHour
+      if (ratePerMs > 0) {
+        const remainingMin = Math.round(remainingMs / 60_000)
+        estimatedMinutesToLimit = Math.min(Math.round(remaining / ratePerMs / 60_000), remainingMin)
+      }
+    }
+
+    return { onPace, timeElapsedPct, estimatedMinutesToLimit }
+  }
+
+  /** Persist current usage to localStorage so it survives app restarts */
+  private _persistUsage() {
+    if (!this._claudeUsage) return
+    try {
+      const { fiveHourStale: _, ...data } = this._claudeUsage
+      localStorage.setItem(WorkspaceStore._USAGE_CACHE_KEY, JSON.stringify({
+        ...data,
+        savedAt: new Date().toISOString(),
+      }))
+    } catch { /* quota exceeded or unavailable — non-fatal */ }
+  }
+
+  /** Restore persisted usage on startup; clears components whose resetsAt has already passed */
+  private _loadPersistedUsage() {
+    try {
+      const raw = localStorage.getItem(WorkspaceStore._USAGE_CACHE_KEY)
+      if (!raw) return
+      const cached = JSON.parse(raw) as {
+        fiveHour: number | null; sevenDay: number | null
+        fiveHourReset: string | null; sevenDayReset: string | null
+        savedAt?: string
+      }
+      const now = Date.now()
+      const fiveResetMs = cached.fiveHourReset ? new Date(cached.fiveHourReset).getTime() : null
+      const sevenResetMs = cached.sevenDayReset ? new Date(cached.sevenDayReset).getTime() : null
+      // If the reset time has already passed, the limit has rolled over — clear that slot
+      const fiveExpired = fiveResetMs !== null && now > fiveResetMs
+      const sevenExpired = sevenResetMs !== null && now > sevenResetMs
+      // Load as not-stale — SDK event or successful poll will confirm freshness.
+      // The stale timer started by the first failed poll will mark stale if no data arrives.
+      this._claudeUsage = {
+        fiveHour:      fiveExpired  ? null : cached.fiveHour,
+        fiveHourReset: fiveExpired  ? null : cached.fiveHourReset,
+        sevenDay:      sevenExpired ? null : cached.sevenDay,
+        sevenDayReset: sevenExpired ? null : cached.sevenDayReset,
+        fiveHourStale: false,
+      }
+      this.notify()
+    } catch { /* corrupt cache — ignore, polling will populate fresh data */ }
+  }
+
+  private _clearFiveHourStaleTimer() {
+    if (this._fiveHourStaleTimer) {
+      clearTimeout(this._fiveHourStaleTimer)
+      this._fiveHourStaleTimer = null
+    }
+  }
+
+  /** Start the stale timer only if not already running and not already stale.
+   *  If the current poll interval already exceeds the stale threshold (e.g. 30min backoff or
+   *  server-directed rate limit), mark stale immediately — waiting 10min would show stale data
+   *  as fresh during a window where we know no poll is coming. */
+  private _startFiveHourStaleTimerIfNeeded() {
+    if (this._fiveHourStaleTimer !== null) return   // timer already running — don't reset
+    if (this._claudeUsage?.fiveHourStale) return    // already stale — nothing to do
+    if (this._usageCurrentInterval > WorkspaceStore._FIVE_HOUR_STALE_MS) {
+      // Next poll is further away than the stale window — no point waiting for the timer
+      const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+      this._claudeUsage = { ...prev, fiveHourStale: true }
+      window.electronAPI.debug.log(`[usage:poll] stale immediately — next poll in ${this._usageCurrentInterval / 60000}min`)
+      this.notify()
+      return
+    }
+    this._fiveHourStaleTimer = setTimeout(() => {
+      this._fiveHourStaleTimer = null
+      const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+      this._claudeUsage = { ...prev, fiveHourStale: true }
+      window.electronAPI.debug.log(`[usage:poll] stale — no data for ${WorkspaceStore._FIVE_HOUR_STALE_MS / 60000} min`)
+      this.notify()
+    }, WorkspaceStore._FIVE_HOUR_STALE_MS)
+  }
 
   private async _fetchUsage() {
     if (this._usageInflight) return
     this._usageInflight = true
     try {
       const u = await window.electronAPI.claude.getUsage()
-      if (!u) return
+      if (!u) {
+        // null = both auth methods returned non-OK (e.g. 401/403/5xx) — counts as a failure
+        this._startFiveHourStaleTimerIfNeeded()
+        return
+      }
 
       // Handle rate-limit response from main process
       // Use server's retryAfterSec directly — do not double existing interval,
       // since OAuth always rate-limits on Windows and exponential backoff causes 1.5h+ staleness
       if ('rateLimited' in u && (u as any).rateLimited) {
-        const retryAfterMs = ((u as any).retryAfterSec || 60) * 1000
-        this._usageCurrentInterval = Math.min(retryAfterMs, this._usageMaxInterval)
+        this._usageRateLimitStreak++
+        // cumulative backoff: 120s → 240s → 480s → 600s (10 min cap), ignores server retry-after
+        const backoffMs = Math.min(120_000 * Math.pow(2, this._usageRateLimitStreak - 1), this._usageMaxInterval)
+        this._usageCurrentInterval = backoffMs
+        this._usageRateLimited = true
+        window.electronAPI.debug.log(`[usage:poll] rate-limited (streak=${this._usageRateLimitStreak}), retry in ${Math.round(backoffMs / 1000)}s`)
+        this._startFiveHourStaleTimerIfNeeded()
         return
       }
 
-      // Success — reset to base interval
+      // Success — cancel stale timer, clear stale flag, reset poll interval
+      // Merge with existing state: prefer poll values, fall back to prior SDK event values for null fields
+      this._clearFiveHourStaleTimer()
+      this._usageRateLimited = false
+      this._usageRateLimitStreak = 0
       this._usageCurrentInterval = this._usageBaseInterval
-      this._claudeUsage = u
+      const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+      const polled = u as any
+      window.electronAPI.debug.log(`[usage:poll] OK 5h=${polled.fiveHour} 7d=${polled.sevenDay} 5hReset=${polled.fiveHourReset} 7dReset=${polled.sevenDayReset}`)
+      this._claudeUsage = {
+        fiveHour:      polled.fiveHour      ?? prev.fiveHour,
+        sevenDay:      polled.sevenDay      ?? prev.sevenDay,
+        fiveHourReset: polled.fiveHourReset ?? prev.fiveHourReset,
+        sevenDayReset: polled.sevenDayReset ?? prev.sevenDayReset,
+        fiveHourStale: false,
+      }
+      this._persistUsage()
       this.notify()
     } catch {
-      // Network error — double the interval (exponential backoff)
+      // Network error — clear rate-limit flag (different failure type), double interval
+      this._usageRateLimited = false
       this._usageCurrentInterval = Math.min(this._usageCurrentInterval * 2, this._usageMaxInterval)
+      this._startFiveHourStaleTimerIfNeeded()
     } finally {
       this._usageInflight = false
     }
   }
 
   private _scheduleNextPoll() {
+    if (!this._usagePollingStarted) return
     if (this._usageTimer) clearTimeout(this._usageTimer)
     this._usageTimer = setTimeout(async () => {
       await this._fetchUsage()
@@ -72,6 +206,9 @@ class WorkspaceStore {
   startUsagePolling() {
     if (this._usagePollingStarted) return
     this._usagePollingStarted = true
+
+    // Restore last known values immediately so UI isn't blank on startup
+    this._loadPersistedUsage()
 
     // Initial fetch
     this._fetchUsage().then(() => this._scheduleNextPoll())
@@ -92,12 +229,49 @@ class WorkspaceStore {
     document.addEventListener('visibilitychange', this._visibilityHandler)
   }
 
+  /** Update usage from SDK rate_limit_event — no API call needed.
+   *  utilization may be undefined (SDK often omits it); resetsAt is usually present. */
+  applyRateLimitEvent(info: { rateLimitType: string; utilization?: number; resetsAt?: number }) {
+    const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
+    const resetIso = info.resetsAt ? new Date(info.resetsAt).toISOString() : null
+    if (info.rateLimitType === 'five_hour') {
+      this._clearFiveHourStaleTimer()
+      this._claudeUsage = {
+        ...prev,
+        fiveHour: info.utilization ?? prev.fiveHour,     // keep existing if SDK omits
+        fiveHourReset: resetIso ?? prev.fiveHourReset,
+        fiveHourStale: false,
+      }
+    } else if (info.rateLimitType === 'seven_day' || info.rateLimitType === 'seven_day_opus' || info.rateLimitType === 'seven_day_sonnet') {
+      this._claudeUsage = {
+        ...prev,
+        sevenDay: info.utilization ?? prev.sevenDay,
+        sevenDayReset: resetIso ?? prev.sevenDayReset,
+      }
+    }
+    this._persistUsage()
+    this.notify()
+  }
+
   /** Call after agent activity (turn completed, session ended) for a timely refresh */
   refreshUsageNow() {
     if (!this._usagePollingStarted) return
-    // Use shorter interval temporarily after activity
+    // Skip if in rate-limit backoff — hammering a rate-limited endpoint only extends the ban
+    if (this._usageRateLimited) return
+    if (this._usageTimer) { clearTimeout(this._usageTimer); this._usageTimer = null }
     this._usageCurrentInterval = this._usageMinInterval
     this._fetchUsage().then(() => this._scheduleNextPoll())
+  }
+
+  /** Release all polling resources (timers + event listeners) */
+  stopUsagePolling() {
+    if (this._usageTimer) { clearTimeout(this._usageTimer); this._usageTimer = null }
+    this._clearFiveHourStaleTimer()
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler)
+      this._visibilityHandler = null
+    }
+    this._usagePollingStarted = false
   }
 
   getState(): AppState {
@@ -267,7 +441,7 @@ class WorkspaceStore {
   }
 
   // Terminal actions
-  addTerminal(workspaceId: string, agentPreset?: AgentPresetId): TerminalInstance {
+  addTerminal(workspaceId: string, agentPreset?: AgentPresetId, options?: { model?: string }): TerminalInstance {
     const workspace = this.state.workspaces.find(w => w.id === workspaceId)
     if (!workspace) throw new Error('Workspace not found')
 
@@ -289,7 +463,8 @@ class WorkspaceStore {
       title,
       cwd: workspace.folderPath,
       scrollbackBuffer: [],
-      lastActivityTime: Date.now()
+      lastActivityTime: Date.now(),
+      ...(options?.model ? { model: options.model } : {}),
     }
 
     // Auto-focus if it's an agent terminal or no current focus
@@ -366,23 +541,21 @@ class WorkspaceStore {
   }
 
   appendScrollback(id: string, data: string): void {
-    this.state = {
-      ...this.state,
-      terminals: this.state.terminals.map(t =>
-        t.id === id ? { ...t, scrollbackBuffer: [...t.scrollbackBuffer, data] } : t
-      )
-    }
-    // Don't notify for scrollback updates to avoid re-renders
+    // Direct mutation — no notify() means React never reads this via subscription,
+    // so immutability provides no benefit; avoids O(n) spread on every PTY data event
+    const terminal = this.state.terminals.find(t => t.id === id)
+    if (terminal) terminal.scrollbackBuffer.push(data)
   }
 
   clearScrollback(id: string): void {
+    // Immutable update + notify: clears the buffer AND triggers re-render so UI reflects empty state.
+    // Must replace the array reference so any component reading scrollbackBuffer sees the change.
     this.state = {
       ...this.state,
       terminals: this.state.terminals.map(t =>
         t.id === id ? { ...t, scrollbackBuffer: [] } : t
       )
     }
-
     this.notify()
   }
 
