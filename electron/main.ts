@@ -520,8 +520,9 @@ function registerProxiedHandlers() {
     return true
   })
 
-  // Claude usage (5h / 7d rate limits) — OAuth only
-  // Chrome 127+ uses App-Bound Encryption (v20) which cannot be decrypted without IElevator COM
+  // Claude usage (5h / 7d rate limits) — Firefox cookie → OAuth fallback
+  // Firefox cookies.sqlite stores sessionKey in plaintext (no decryption needed)
+  // Chrome 127+ uses App-Bound Encryption (v20) — not viable, OAuth as fallback
   let _cachedOAuthToken: string | null = null
   let _tokenCacheTime = 0
   const TOKEN_CACHE_TTL = 10 * 60 * 1000
@@ -805,9 +806,14 @@ function registerProxiedHandlers() {
 
   registerHandler('claude:get-usage', async () => {
     try {
-      const result = await fetchUsageViaOAuth()
-      if (result && 'rateLimited' in result) return result
-      return result
+      // Primary: Firefox session key (plaintext cookie, no decryption)
+      const sessionResult = await fetchUsageViaSessionKey()
+      if (sessionResult) return sessionResult
+
+      // Fallback: OAuth token
+      const oauthResult = await fetchUsageViaOAuth()
+      if (oauthResult && 'rateLimited' in oauthResult) return oauthResult
+      return oauthResult
     } catch (e) {
       logger.error('[usage] get-usage failed:', e)
       return null
