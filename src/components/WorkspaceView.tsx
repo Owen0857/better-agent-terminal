@@ -266,10 +266,35 @@ export function WorkspaceView({ workspace, terminals, focusedTerminalId, isActiv
 
   const handleAddClaudeAgent = useCallback(() => {
     const agentTerminal = workspaceStore.addTerminal(workspace.id, 'claude-code' as AgentPresetId)
-    // Claude Agent SDK session will be started by ClaudeAgentPanel on mount
     workspaceStore.setFocusedTerminal(agentTerminal.id)
     workspaceStore.save()
   }, [workspace.id])
+
+  const handleAddClaudeAgent1M = useCallback(() => {
+    const agentTerminal = workspaceStore.addTerminal(workspace.id, 'claude-code' as AgentPresetId, { model: 'claude-opus-4-6[1m]' })
+    workspaceStore.setFocusedTerminal(agentTerminal.id)
+    workspaceStore.save()
+  }, [workspace.id])
+
+  const handleAddTerminalWithCommand = useCallback(async (command: string) => {
+    const terminal = workspaceStore.addTerminal(workspace.id)
+    const shell = await getShellFromSettings()
+    const settings = settingsStore.getSettings()
+    const customEnv = mergeEnvVars(settings.globalEnvVars, workspace.envVars)
+    window.electronAPI.pty.create({
+      id: terminal.id,
+      cwd: workspace.folderPath,
+      type: 'terminal',
+      shell,
+      customEnv
+    })
+    workspaceStore.setFocusedTerminal(terminal.id)
+    workspaceStore.save()
+    // Type command after PTY is ready (don't press enter — let user confirm)
+    setTimeout(() => {
+      window.electronAPI.pty.write(terminal.id, command)
+    }, 500)
+  }, [workspace.id, workspace.folderPath, workspace.envVars])
 
   const handleCloseTerminal = useCallback((id: string) => {
     const terminal = terminals.find(t => t.id === id)
@@ -408,6 +433,8 @@ export function WorkspaceView({ workspace, terminals, focusedTerminalId, isActiv
         onFocus={handleFocus}
         onAddTerminal={handleAddTerminal}
         onAddClaudeAgent={handleAddClaudeAgent}
+        onAddClaudeAgent1M={handleAddClaudeAgent1M}
+        onAddTerminalWithCommand={handleAddTerminalWithCommand}
         onReorder={handleReorderTerminals}
         showAddButton={true}
         height={thumbnailSettings.height}
