@@ -34,7 +34,8 @@
 - 13 configurable items with custom colors, zone alignment, and template-based config.
 - Usage polling: Firefox cookie (primary) → OAuth `/api/oauth/usage` (fallback).
 - Firefox `cookies.sqlite`: plaintext `value` column, query `moz_cookies` where `host LIKE '%claude.ai%' AND name = 'sessionKey'`.
-- Firefox profile resolved from `profiles.ini` (`Default=1` → `[Profile0]` fallback); supports `IsRelative` flag.
+- Firefox profile resolved from `profiles.ini` (`[Install*]` → `Default=1` → `[Profile0]` fallback); supports `IsRelative` flag.
+- Firefox cookie path cached on first call; Linux supports Snap/Flatpak paths.
 - Session key cached 30 min; EBUSY (Firefox running) skips re-read for 10 min, returns stale cache.
 - Org ID fetched via `claude.ai/api/organizations` with session key cookie, cached 30 min.
 - Chrome 127+ uses App-Bound Encryption (v20/APPB) — DPAPI cannot decrypt. Chrome/Edge cookie approach removed.
