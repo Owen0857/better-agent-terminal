@@ -124,7 +124,6 @@ interface SessionInstance {
   pendingAskUser: Map<string, PendingRequest>
   permissionMode: AppPermissionMode
   effort: 'low' | 'medium' | 'high' | 'max'
-  enable1MContext: boolean
   model?: string
   messageQueue: QueuedMessage[]
   currentPrompt?: string  // Track the currently running prompt for abort context
@@ -261,7 +260,7 @@ export class ClaudeAgentManager {
     this.send('claude:tool-result', sessionId, { id: toolId, ...updates })
   }
 
-  async startSession(sessionId: string, options: { cwd: string; prompt?: string; sdkSessionId?: string; permissionMode?: AppPermissionMode; model?: string; effort?: 'low' | 'medium' | 'high' | 'max'; enable1MContext?: boolean }): Promise<boolean> {
+  async startSession(sessionId: string, options: { cwd: string; prompt?: string; sdkSessionId?: string; permissionMode?: AppPermissionMode; model?: string; effort?: 'low' | 'medium' | 'high' | 'max' }): Promise<boolean> {
     // Prevent duplicate session creation
     if (this.sessions.has(sessionId)) {
       return true
@@ -301,7 +300,6 @@ export class ClaudeAgentManager {
         pendingAskUser: new Map(),
         permissionMode: options.permissionMode || 'default',
         effort: options.effort || 'medium',
-        enable1MContext: options.enable1MContext ?? false,
         model: options.model,
         messageQueue: [],
         activeTasks: new Map(),
@@ -525,7 +523,6 @@ export class ClaudeAgentManager {
         toolConfig: { askUserQuestion: { previewFormat: 'html' } },
         agentProgressSummaries: true,
         ...(session.model ? { model: session.model } : {}),
-        ...(session.enable1MContext ? { betas: ['context-1m-2025-08-07'] } : {}),
         ...(installedPlugins.length > 0 ? { plugins: installedPlugins } : {}),
         canUseTool,
         ...(claudeCodePath ? { pathToClaudeCodeExecutable: claudeCodePath } : {}),
@@ -572,6 +569,11 @@ export class ClaudeAgentManager {
         }
       }
 
+      // Debug: log query options and 1M context strategy
+      const qModel = (queryOptions as { model?: string }).model
+      const is1M = qModel?.includes('[1m]') || false
+      logger.log(`[claude:query] sessionId=${sessionId.slice(0, 8)} model=${qModel || 'default'} is1M=${is1M} resume=${resumeId?.slice(0, 8) || 'none'}`)
+
       const generator = query({
         prompt: promptArg as Parameters<typeof query>[0]['prompt'],
         options: queryOptions as Parameters<typeof query>[0]['options'],
@@ -593,14 +595,12 @@ export class ClaudeAgentManager {
           const msg = message as { rate_limit_info?: { rateLimitType?: string; utilization?: number; resetsAt?: number } }
           const info = msg.rate_limit_info
           logger.log(`[claude:rate_limit_event] type=${info?.rateLimitType ?? 'MISSING'} util=${info?.utilization ?? 'MISSING'} resetsAt=${info?.resetsAt ?? 'MISSING'} raw=${JSON.stringify(message)}`)
-          if (info?.rateLimitType && info.utilization !== undefined) {
+          if (info?.rateLimitType) {
             this.send('claude:usage-update', {
               rateLimitType: info.rateLimitType,
-              utilization: info.utilization,
+              utilization: info.utilization,  // may be undefined — frontend handles it
               resetsAt: info.resetsAt,
             })
-          } else {
-            logger.log(`[claude:rate_limit_event] SKIPPED — missing rateLimitType or utilization`)
           }
         }
         if (message.type === 'assistant') {
@@ -618,9 +618,12 @@ export class ClaudeAgentManager {
 
         if (message.type === 'system' && message.subtype === 'init') {
           // Capture and persist the SDK session ID
-          const initMsg = message as { session_id: string; model?: string; cwd?: string; permissionMode?: string }
+          const initMsg = message as { session_id: string; model?: string; cwd?: string; permissionMode?: string; betas?: string[]; apiKeySource?: string }
           session.sdkSessionId = initMsg.session_id
           sdkSessionIds.set(sessionId, initMsg.session_id)
+
+          // Debug: log init response for 1M context validation
+          logger.log(`[claude:init] sessionId=${sessionId.slice(0, 8)} model=${initMsg.model} betas=${initMsg.betas ? JSON.stringify(initMsg.betas) : 'none'} apiKeySource=${initMsg.apiKeySource || 'unknown'}`)
 
           // Extract metadata from init message
           session.metadata.model = initMsg.model
@@ -795,6 +798,11 @@ export class ClaudeAgentManager {
             if (eventUsage.output_tokens && eventUsage.output_tokens > session.metadata.outputTokens) {
               session.metadata.outputTokens = eventUsage.output_tokens
             }
+            // message_start input_tokens = actual context window usage for this turn
+            if (event.type === 'message_start' && contextTokens > 0) {
+              session.metadata.contextTokens = contextTokens
+              logger.log(`[claude:ctx-live] sessionId=${sessionId.slice(0, 8)} contextTokens=${contextTokens} contextWindow=${session.metadata.contextWindow} pct=${session.metadata.contextWindow > 0 ? Math.round((contextTokens / session.metadata.contextWindow) * 100) : '?'}%`)
+            }
             this.send('claude:status', sessionId, { ...session.metadata })
           }
           if (event.type === 'content_block_delta') {
@@ -966,6 +974,8 @@ export class ClaudeAgentManager {
             logger.log(summary)
             session.metadata.inputTokens = totalInput
             session.metadata.outputTokens = totalOutput
+            // Debug: 1M context validation
+            logger.log(`[claude:1M-check] sessionId=${sessionId.slice(0, 8)} model=${session.model || 'default'} contextWindow=${session.metadata.contextWindow} is1M=${(session.metadata.contextWindow || 0) >= 1000000}`)
           } else if (resultMsg.usage) {
             const usageFull = resultMsg.usage as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
             const cacheRead = usageFull.cache_read_input_tokens || 0
@@ -975,11 +985,6 @@ export class ClaudeAgentManager {
             logger.log(line)
             session.metadata.inputTokens = totalInput
             session.metadata.outputTokens = usageFull.output_tokens || 0
-          }
-
-          // Per-turn usage.input_tokens reflects actual current context size
-          if (resultMsg.usage?.input_tokens) {
-            session.metadata.contextTokens = resultMsg.usage.input_tokens
           }
 
           this.send('claude:status', sessionId, { ...session.metadata })
@@ -1184,15 +1189,6 @@ export class ClaudeAgentManager {
     // Always persist the model on the session so the next runQuery picks it up
     session.model = model
     session.metadata.model = model
-    if (session.enable1MContext && model.includes('haiku')) {
-      this.send('claude:message', sessionId, {
-        id: `warn-1m-${Date.now()}`,
-        sessionId,
-        role: 'system',
-        content: `⚠ 1M context is enabled but model "${model}" does not support it. Beta will be ignored by API.`,
-        timestamp: Date.now(),
-      } satisfies ClaudeMessage)
-    }
 
     if (!session.queryInstance) {
       // No active query yet — model will be used when the next query starts
@@ -1217,22 +1213,6 @@ export class ClaudeAgentManager {
     const session = this.sessions.get(sessionId)
     if (!session) return false
     session.effort = effort
-    return true
-  }
-
-  set1MContext(sessionId: string, enable: boolean): boolean {
-    const session = this.sessions.get(sessionId)
-    if (!session) return false
-    session.enable1MContext = enable
-    if (enable && session.model?.includes('haiku')) {
-      this.send('claude:message', sessionId, {
-        id: `warn-1m-${Date.now()}`,
-        sessionId,
-        role: 'system',
-        content: `⚠ 1M context is enabled but model "${session.model}" does not support it. Beta will be ignored by API.`,
-        timestamp: Date.now(),
-      } satisfies ClaudeMessage)
-    }
     return true
   }
 
@@ -1568,7 +1548,7 @@ export class ClaudeAgentManager {
     this.send('claude:history', sessionId, items)
   }
 
-  async resumeSession(sessionId: string, sdkSessionIdToResume: string, cwd: string, model?: string, enable1MContext?: boolean): Promise<boolean> {
+  async resumeSession(sessionId: string, sdkSessionIdToResume: string, cwd: string, model?: string): Promise<boolean> {
     // Stop current session if running
     const session = this.sessions.get(sessionId)
     if (session) {
@@ -1579,7 +1559,7 @@ export class ClaudeAgentManager {
     // Store the SDK session ID so startSession will use it for resume
     sdkSessionIds.set(sessionId, sdkSessionIdToResume)
     // startSession already calls loadSessionHistory when sdkSessionId is provided
-    const result = await this.startSession(sessionId, { cwd, sdkSessionId: sdkSessionIdToResume, model, permissionMode: 'bypassPermissions', enable1MContext })
+    const result = await this.startSession(sessionId, { cwd, sdkSessionId: sdkSessionIdToResume, model, permissionMode: 'bypassPermissions' })
     return result
   }
 
@@ -1610,7 +1590,6 @@ export class ClaudeAgentManager {
     const cwd = session.cwd
     const permissionMode = session.permissionMode
     const effort = session.effort
-    const enable1MContext = session.enable1MContext
     const model = session.model
 
     // Tear down old session completely
@@ -1621,7 +1600,7 @@ export class ClaudeAgentManager {
     sdkSessionIds.delete(sessionId)
 
     // Start a fresh session preserving settings
-    const ok = await this.startSession(sessionId, { cwd, permissionMode, effort, enable1MContext, model })
+    const ok = await this.startSession(sessionId, { cwd, permissionMode, effort, model })
     // Notify all windows to clear UI for this session
     this.send('claude:session-reset', sessionId)
     return ok
