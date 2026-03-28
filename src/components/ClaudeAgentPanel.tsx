@@ -129,7 +129,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   const [permissionMode, setPermissionMode] = useState<string>('bypassPermissions')
   const [currentModel, setCurrentModel] = useState<string>('')
   const [effortLevel, setEffortLevel] = useState<string>('medium')
-  const [enable1MContext, setEnable1MContext] = useState(() => settingsStore.getSettings().enable1MContext !== false)
   const [claudeUsage, setClaudeUsage] = useState(workspaceStore.claudeUsage)
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([])
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null)
@@ -744,17 +743,13 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       const effectiveEffort = globalSettings.defaultEffort || 'medium'
       setEffortLevel(effectiveEffort)
 
-      // Use global default 1M context setting
-      const effective1MContext = globalSettings.enable1MContext !== false
-      setEnable1MContext(effective1MContext)
-
       if (savedSdkSessionId) {
         dlog(`${stag} AUTO-RESUME sdkSessionId=${savedSdkSessionId.slice(0, 8)}`)
         historyLoadedRef.current = true
-        window.electronAPI.claude.resumeSession(sessionId, savedSdkSessionId, cwd, savedModel, effective1MContext)
+        window.electronAPI.claude.resumeSession(sessionId, savedSdkSessionId, cwd, savedModel)
       } else {
-        dlog(`${stag} FRESH startSession`)
-        window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode, model: effectiveModel, effort: effectiveEffort as 'low' | 'medium' | 'high' | 'max', enable1MContext: effective1MContext })
+        dlog(`${stag} FRESH startSession model=${effectiveModel || 'SDK-default'}`)
+        window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode, model: effectiveModel, effort: effectiveEffort as 'low' | 'medium' | 'high' | 'max' })
       }
     }
     return () => {
@@ -780,7 +775,18 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       window.electronAPI.claude.getSupportedModels(sessionId).then((models: ModelInfo[]) => {
         console.log('[getSupportedModels] raw response:', JSON.stringify(models, null, 2))
         if (models && models.length > 0) {
-          setAvailableModels(models)
+          // Inject [1m] variants for models that support 1M context
+          const withExtras = [...models]
+          const opusEntry = models.find(m => m.value === 'claude-opus-4-6')
+          if (opusEntry && !models.some(m => m.value === 'claude-opus-4-6[1m]')) {
+            const idx = models.indexOf(opusEntry)
+            withExtras.splice(idx + 1, 0, {
+              value: 'claude-opus-4-6[1m]',
+              displayName: 'Claude Opus 4.6 [1M]',
+              description: 'Opus 4.6 with 1M token context window',
+            })
+          }
+          setAvailableModels(withExtras)
         }
       }).catch(() => {})
       window.electronAPI.claude.getAccountInfo(sessionId).then(info => {
@@ -878,7 +884,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     sessionStartedRef.current = false
     // Mark that history will be loaded — prevents sys-init from wiping messages
     historyLoadedRef.current = true
-    await window.electronAPI.claude.resumeSession(sessionId, sdkSessionId, cwd, undefined, enable1MContext)
+    await window.electronAPI.claude.resumeSession(sessionId, sdkSessionId, cwd)
     workspaceStore.setTerminalSdkSessionId(sessionId, sdkSessionId)
   }, [sessionId, cwd])
 
@@ -1226,13 +1232,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     setEffortLevel(next)
     await window.electronAPI.claude.setEffort(sessionId, next)
   }, [sessionId])
-
-  const handle1MContextToggle = useCallback(async () => {
-    const next = !enable1MContext
-    setEnable1MContext(next)
-    settingsStore.setEnable1MContext(next)
-    await window.electronAPI.claude.set1MContext(sessionId, next)
-  }, [sessionId, enable1MContext])
 
   const showDontAskAgain = (pendingPermission?.suggestions?.length ?? 0) > 0
     || pendingPermission?.toolName === 'ExitPlanMode'
@@ -2708,13 +2707,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <option value="medium">medium</option>
               <option value="high">high</option>
             </select>
-            <span
-              className={`claude-1m-toggle${enable1MContext ? ' active' : ''}`}
-              onClick={handle1MContextToggle}
-              title={enable1MContext ? t('claude.1MContextEnabled') : t('claude.1MContextDisabled')}
-            >
-              1M
-            </span>
             {accountInfo?.organization && (
               <span className="claude-status-btn claude-account-info" title={`${accountInfo.email || ''} (${accountInfo.subscriptionType || 'unknown'})`}>
                 {accountInfo.organization}
@@ -2928,9 +2920,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             if (!sessionMeta || sessionMeta.contextWindow <= 0) return null
             const ctxTokens = sessionMeta.contextTokens || (sessionMeta.inputTokens + sessionMeta.outputTokens)
             const pct = Math.round((ctxTokens / sessionMeta.contextWindow) * 100)
+            const ctxColor = pct <= 50 ? '#98c379' : pct < 80 ? '#e5c07b' : '#e06c75'
+            const is1M = sessionMeta.contextWindow >= 1000000
             return (
-              <span key="contextPct" className="claude-statusline-item" title={`context: ${ctxTokens.toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens\ntotal: ${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} tok`}>
-                ctx {pct}%
+              <span key="contextPct" className="claude-statusline-item" style={{ color: ctxColor }} title={`context: ${ctxTokens.toLocaleString()} / ${sessionMeta.contextWindow.toLocaleString()} tokens\ntotal: ${(sessionMeta.inputTokens + sessionMeta.outputTokens).toLocaleString()} tok`}>
+                ctx {pct}%{is1M && <span style={{ color: '#6cf', marginLeft: 3, fontWeight: 600 }}>1M</span>}
               </span>
             )
           },
@@ -2947,9 +2941,22 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <span key="usage5h" className="claude-statusline-item claude-usage-stale">5h:--%</span>
             )
             if (claudeUsage.fiveHour == null) return null
+            const pacing = workspaceStore.getUsagePacing()
+            const paceIcon = pacing ? (pacing.onPace ? '▼' : '▲') : ''
+            const paceClass = pacing && !pacing.onPace ? ' claude-usage-overpace' : ''
+            let title = `5h utilization: ${claudeUsage.fiveHour.toFixed(1)}%`
+            if (pacing) {
+              title += `\nTime elapsed: ${pacing.timeElapsedPct.toFixed(0)}%`
+              title += pacing.onPace ? '\nOn pace ── usage within window budget' : '\nOver pace ── burning faster than replenish'
+              if (pacing.estimatedMinutesToLimit != null) {
+                const h = Math.floor(pacing.estimatedMinutesToLimit / 60)
+                const m = pacing.estimatedMinutesToLimit % 60
+                title += `\nEstimated limit in: ${h > 0 ? `${h}h${m}m` : `${m}m`}`
+              }
+            }
             return (
-              <span key="usage5h" className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ' claude-usage-low'}`}>
-                5h:{Math.round(claudeUsage.fiveHour)}%
+              <span key="usage5h" title={title} className={`claude-statusline-item${claudeUsage.fiveHour > 80 ? ' claude-usage-high' : claudeUsage.fiveHour > 50 ? ' claude-usage-mid' : ' claude-usage-low'}${paceClass}`}>
+                5h:{Math.round(claudeUsage.fiveHour)}%{paceIcon}
               </span>
             )
           },
@@ -2983,8 +2990,8 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
           for (const item of items) {
             let node = renderers[item.id]?.()
             if (!node) continue
-            // Apply color directly on the element via cloneElement to override class-based colors
-            if (item.color && isValidElement(node)) {
+            // Apply color from config, but don't override dynamic colors already set on the element
+            if (item.color && isValidElement(node) && !node.props.style?.color) {
               node = cloneElement(node, { style: { ...(node.props.style || {}), color: item.color } })
             }
             nodes.push(node)
