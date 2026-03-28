@@ -233,7 +233,8 @@ class WorkspaceStore {
    *  utilization may be undefined (SDK often omits it); resetsAt is usually present. */
   applyRateLimitEvent(info: { rateLimitType: string; utilization?: number; resetsAt?: number }) {
     const prev = this._claudeUsage ?? { fiveHour: null, sevenDay: null, fiveHourReset: null, sevenDayReset: null }
-    const resetIso = info.resetsAt ? new Date(info.resetsAt).toISOString() : null
+    // SDK resetsAt is Unix seconds; convert to ms for Date constructor
+    const resetIso = info.resetsAt ? new Date(info.resetsAt * 1000).toISOString() : null
     if (info.rateLimitType === 'five_hour') {
       this._clearFiveHourStaleTimer()
       this._claudeUsage = {
