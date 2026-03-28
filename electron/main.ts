@@ -520,11 +520,275 @@ function registerProxiedHandlers() {
     return true
   })
 
-  // Claude usage (5h / 7d rate limits) — OAuth only
-  // Chrome 127+ uses App-Bound Encryption (v20) which cannot be decrypted without IElevator COM
+  // Claude usage (5h / 7d rate limits) — Firefox cookie → OAuth fallback
+  // Firefox cookies.sqlite stores sessionKey in plaintext (no decryption needed)
+  // Chrome 127+ uses App-Bound Encryption (v20) — not viable, OAuth as fallback
   let _cachedOAuthToken: string | null = null
   let _tokenCacheTime = 0
   const TOKEN_CACHE_TTL = 10 * 60 * 1000
+
+  // --- Firefox cookie-based usage polling (primary source) ---
+
+  let _cachedCookiesPath: string | null | undefined = undefined // undefined = not yet resolved
+
+  /** Resolve Firefox default profile cookies.sqlite path cross-platform (cached on first call) */
+  async function getFirefoxCookiePath(): Promise<string | null> {
+    if (_cachedCookiesPath !== undefined) return _cachedCookiesPath
+
+    try {
+      // Linux: try standard, Snap, Flatpak paths
+      const profilesDirs: string[] = []
+      if (process.platform === 'win32') {
+        profilesDirs.push(path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Mozilla', 'Firefox'))
+      } else if (process.platform === 'darwin') {
+        profilesDirs.push(path.join(os.homedir(), 'Library', 'Application Support', 'Firefox'))
+      } else {
+        profilesDirs.push(path.join(os.homedir(), '.mozilla', 'firefox'))
+        profilesDirs.push(path.join(os.homedir(), 'snap', 'firefox', 'common', '.mozilla', 'firefox'))
+        profilesDirs.push(path.join(os.homedir(), '.var', 'app', 'org.mozilla.firefox', '.mozilla', 'firefox'))
+      }
+
+      for (const profilesDir of profilesDirs) {
+        const result = await _resolveFirefoxProfile(profilesDir)
+        if (result) {
+          _cachedCookiesPath = result
+          logger.log('[usage] Firefox cookies.sqlite path:', result)
+          return result
+        }
+      }
+
+      _cachedCookiesPath = null
+      return null
+    } catch {
+      _cachedCookiesPath = null
+      return null
+    }
+  }
+
+  async function _resolveFirefoxProfile(profilesDir: string): Promise<string | null> {
+    try {
+
+      const iniPath = path.join(profilesDir, 'profiles.ini')
+      const iniContent = await fs.readFile(iniPath, 'utf-8')
+      const lines = iniContent.split(/\r?\n/)
+
+      // Parse INI into sections
+      const sections: Record<string, Record<string, string>> = {}
+      let currentSection = ''
+      for (const line of lines) {
+        const sectionMatch = line.match(/^\[(.+)\]$/)
+        if (sectionMatch) {
+          currentSection = sectionMatch[1]
+          sections[currentSection] = {}
+        } else if (currentSection) {
+          const kvMatch = line.match(/^([^=]+)=(.*)$/)
+          if (kvMatch) sections[currentSection][kvMatch[1].trim()] = kvMatch[2].trim()
+        }
+      }
+
+      // Find profile path priority:
+      // 1. [Install*] section Default= (Firefox's actual active profile path)
+      // 2. [Profile*] section with Default=1
+      // 3. [Profile0] fallback
+      let profilePath: string | null = null
+      let isRelative = true
+
+      // 1. Check [Install*] sections — these point to the actively-used profile
+      //    [Install*] Default= is always relative to profilesDir (no IsRelative key)
+      for (const [name, props] of Object.entries(sections)) {
+        if (name.startsWith('Install') && props['Default']) {
+          profilePath = props['Default']
+          isRelative = true
+          break
+        }
+      }
+
+      // 2. Fall back to section with Default=1
+      if (!profilePath) {
+        for (const [, props] of Object.entries(sections)) {
+          if (props['Default'] === '1' && props['Path']) {
+            profilePath = props['Path']
+            isRelative = props['IsRelative'] !== '0'
+            break
+          }
+        }
+      }
+
+      // 3. Fall back to Profile0
+      if (!profilePath && sections['Profile0']?.['Path']) {
+        profilePath = sections['Profile0']['Path']
+        isRelative = sections['Profile0']['IsRelative'] !== '0'
+      }
+
+      if (!profilePath) return null
+
+      const fullProfilePath = isRelative ? path.join(profilesDir, profilePath) : profilePath
+      const cookiesPath = path.join(fullProfilePath, 'cookies.sqlite')
+
+      // Verify file exists
+      await fs.access(cookiesPath)
+      return cookiesPath
+    } catch {
+      return null
+    }
+  }
+
+
+
+  let _sqlJs: any = null // cached sql.js WASM instance
+  let _cachedSessionKey: string | null = null
+  let _sessionKeyCacheTime = 0
+  const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000
+  let _firefoxSkipUntil = 0
+
+  /** Extract sessionKey cookie from Firefox cookies.sqlite via sql.js (WASM) */
+  async function getSessionKeyFromFirefox(): Promise<string | null> {
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return _cachedSessionKey
+    }
+    if (now < _firefoxSkipUntil) {
+      return _cachedSessionKey // stale or null
+    }
+
+    const cookiesPath = await getFirefoxCookiePath()
+    if (!cookiesPath) return null
+
+    try {
+      if (!_sqlJs) {
+        const initSqlJs = (await import('sql.js')).default
+        _sqlJs = await initSqlJs()
+      }
+      const buf = await fs.readFile(cookiesPath)
+      const db = new _sqlJs.Database(new Uint8Array(buf))
+      try {
+        const result = db.exec(
+          "SELECT value FROM moz_cookies WHERE host LIKE '%claude.ai%' AND name = 'sessionKey' LIMIT 1"
+        )
+        if (result.length > 0 && result[0].values.length > 0) {
+          const value = String(result[0].values[0][0])
+          if (value) {
+            _cachedSessionKey = value
+            _sessionKeyCacheTime = now
+            logger.log('[usage] Extracted session key from Firefox (length:', value.length, ')')
+            return value
+          }
+        }
+        logger.log('[usage] Firefox cookies.sqlite found but no sessionKey cookie')
+        return null
+      } finally {
+        db.close()
+      }
+    } catch (e: unknown) {
+      const err = e as NodeJS.ErrnoException
+      if (err.code === 'EBUSY') {
+        _firefoxSkipUntil = now + 10 * 60 * 1000
+        logger.log('[usage] Firefox cookies.sqlite is locked (EBUSY), skipping for 10 min')
+        return _cachedSessionKey
+      }
+      logger.log('[usage] Firefox cookie read error:', err.message)
+      return null
+    }
+  }
+
+  let _cachedOrgId: string | null = null
+  let _orgIdCacheTime = 0
+  const ORG_ID_CACHE_TTL = 30 * 60 * 1000
+  let _orgIdForSessionKey: string | null = null
+
+  function getChromeUserAgent(): string {
+    if (process.platform === 'darwin') {
+      return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    if (process.platform === 'linux') {
+      return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  }
+
+  /** Fetch org ID from Claude API using session cookie */
+  async function getOrgId(sessionKey: string): Promise<string | null> {
+    const now = Date.now()
+    if (_cachedOrgId && now - _orgIdCacheTime < ORG_ID_CACHE_TTL && _orgIdForSessionKey === sessionKey) {
+      return _cachedOrgId
+    }
+    try {
+      const res = await fetch('https://claude.ai/api/organizations', {
+        headers: {
+          'Cookie': `sessionKey=${sessionKey}`,
+          'User-Agent': getChromeUserAgent(),
+          'Accept': 'application/json',
+        },
+      })
+
+      if (res.status === 401 || res.status === 403) {
+        _cachedSessionKey = null
+        _sessionKeyCacheTime = 0
+        _cachedOrgId = null
+        _orgIdCacheTime = 0
+        _orgIdForSessionKey = null
+        logger.log('[usage] [session] org fetch auth error', res.status, '— cleared caches')
+        return null
+      }
+
+      if (!res.ok) return null
+
+      const orgs = await res.json() as any[]
+      const uuid = orgs?.[0]?.uuid
+      if (!uuid) return null
+
+      _cachedOrgId = uuid
+      _orgIdCacheTime = now
+      _orgIdForSessionKey = sessionKey
+      return uuid
+    } catch (err) {
+      logger.log('[usage] [session] org fetch failed:', err)
+      return null
+    }
+  }
+
+  /** Fetch usage via Firefox session cookie (primary source) */
+  async function fetchUsageViaSessionKey(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null> {
+    const sessionKey = await getSessionKeyFromFirefox()
+    if (!sessionKey) return null
+
+    const orgId = await getOrgId(sessionKey)
+    if (!orgId) return null
+
+    try {
+      const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
+        headers: {
+          'Cookie': `sessionKey=${sessionKey}`,
+          'User-Agent': getChromeUserAgent(),
+          'Accept': 'application/json',
+        },
+      })
+
+      if (res.status === 401 || res.status === 403) {
+        _cachedSessionKey = null
+        _sessionKeyCacheTime = 0
+        _cachedOrgId = null
+        _orgIdCacheTime = 0
+        _orgIdForSessionKey = null
+        logger.log('[usage] [session] usage fetch auth error', res.status, '— cleared caches')
+        return null
+      }
+
+      if (!res.ok) return null
+
+      const data = await res.json() as any
+      logger.log('[usage] [session] 5h=', data.five_hour?.utilization, '7d=', data.seven_day?.utilization)
+      return {
+        fiveHour: data.five_hour?.utilization ?? null,
+        sevenDay: data.seven_day?.utilization ?? null,
+        fiveHourReset: data.five_hour?.resets_at ?? null,
+        sevenDayReset: data.seven_day?.resets_at ?? null,
+      }
+    } catch (err) {
+      logger.log('[usage] [session] usage fetch failed:', err)
+      return null
+    }
+  }
 
   async function getOAuthToken(): Promise<string | null> {
     const now = Date.now()
@@ -599,9 +863,14 @@ function registerProxiedHandlers() {
 
   registerHandler('claude:get-usage', async () => {
     try {
-      const result = await fetchUsageViaOAuth()
-      if (result && 'rateLimited' in result) return result
-      return result
+      // Primary: Firefox session key (plaintext cookie, no decryption)
+      const sessionResult = await fetchUsageViaSessionKey()
+      if (sessionResult) return sessionResult
+
+      // Fallback: OAuth token
+      const oauthResult = await fetchUsageViaOAuth()
+      if (oauthResult && 'rateLimited' in oauthResult) return oauthResult
+      return oauthResult
     } catch (e) {
       logger.error('[usage] get-usage failed:', e)
       return null
