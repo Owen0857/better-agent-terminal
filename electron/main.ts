@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, powerMonitor, clipboard, nativeImage } from 'electron'
 import path from 'path'
+import os from 'os'
 import * as fs from 'fs/promises'
 import * as fsSync from 'fs'
 import { execFileSync } from 'child_process'
@@ -447,7 +448,6 @@ function registerProxiedHandlers() {
   registerHandler('claude:set-permission-mode', (sessionId: string, mode: string) => claudeManager?.setPermissionMode(sessionId, mode as import('@anthropic-ai/claude-agent-sdk').PermissionMode))
   registerHandler('claude:set-model', (sessionId: string, model: string) => claudeManager?.setModel(sessionId, model))
   registerHandler('claude:set-effort', (sessionId: string, effort: string) => claudeManager?.setEffort(sessionId, effort as 'low' | 'medium' | 'high' | 'max'))
-  registerHandler('claude:set-1m-context', (sessionId: string, enable: boolean) => claudeManager?.set1MContext(sessionId, enable))
   registerHandler('claude:reset-session', (sessionId: string) => claudeManager?.resetSession(sessionId))
   registerHandler('claude:get-supported-models', (sessionId: string) => claudeManager?.getSupportedModels(sessionId))
   registerHandler('claude:get-account-info', (sessionId: string) => claudeManager?.getAccountInfo(sessionId))
@@ -520,17 +520,275 @@ function registerProxiedHandlers() {
     return true
   })
 
-  // Claude usage (5h / 7d rate limits)
-  // Primary: session key from Chrome cookies (lenient rate limits on claude.ai)
-  // Fallback: OAuth token from Claude Code credentials (strict rate limits on api.anthropic.com)
+  // Claude usage (5h / 7d rate limits) — Firefox cookie → OAuth fallback
+  // Firefox cookies.sqlite stores sessionKey in plaintext (no decryption needed)
+  // Chrome 127+ uses App-Bound Encryption (v20) — not viable, OAuth as fallback
   let _cachedOAuthToken: string | null = null
-  let _cachedSessionKey: string | null = null
-  let _cachedOrgId: string | null = null
-  let _cachedCfClearance: string | null = null
   let _tokenCacheTime = 0
+  const TOKEN_CACHE_TTL = 10 * 60 * 1000
+
+  // --- Firefox cookie-based usage polling (primary source) ---
+
+  let _cachedCookiesPath: string | null | undefined = undefined // undefined = not yet resolved
+
+  /** Resolve Firefox default profile cookies.sqlite path cross-platform (cached on first call) */
+  async function getFirefoxCookiePath(): Promise<string | null> {
+    if (_cachedCookiesPath !== undefined) return _cachedCookiesPath
+
+    try {
+      // Linux: try standard, Snap, Flatpak paths
+      const profilesDirs: string[] = []
+      if (process.platform === 'win32') {
+        profilesDirs.push(path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Mozilla', 'Firefox'))
+      } else if (process.platform === 'darwin') {
+        profilesDirs.push(path.join(os.homedir(), 'Library', 'Application Support', 'Firefox'))
+      } else {
+        profilesDirs.push(path.join(os.homedir(), '.mozilla', 'firefox'))
+        profilesDirs.push(path.join(os.homedir(), 'snap', 'firefox', 'common', '.mozilla', 'firefox'))
+        profilesDirs.push(path.join(os.homedir(), '.var', 'app', 'org.mozilla.firefox', '.mozilla', 'firefox'))
+      }
+
+      for (const profilesDir of profilesDirs) {
+        const result = await _resolveFirefoxProfile(profilesDir)
+        if (result) {
+          _cachedCookiesPath = result
+          logger.log('[usage] Firefox cookies.sqlite path:', result)
+          return result
+        }
+      }
+
+      _cachedCookiesPath = null
+      return null
+    } catch {
+      _cachedCookiesPath = null
+      return null
+    }
+  }
+
+  async function _resolveFirefoxProfile(profilesDir: string): Promise<string | null> {
+    try {
+
+      const iniPath = path.join(profilesDir, 'profiles.ini')
+      const iniContent = await fs.readFile(iniPath, 'utf-8')
+      const lines = iniContent.split(/\r?\n/)
+
+      // Parse INI into sections
+      const sections: Record<string, Record<string, string>> = {}
+      let currentSection = ''
+      for (const line of lines) {
+        const sectionMatch = line.match(/^\[(.+)\]$/)
+        if (sectionMatch) {
+          currentSection = sectionMatch[1]
+          sections[currentSection] = {}
+        } else if (currentSection) {
+          const kvMatch = line.match(/^([^=]+)=(.*)$/)
+          if (kvMatch) sections[currentSection][kvMatch[1].trim()] = kvMatch[2].trim()
+        }
+      }
+
+      // Find profile path priority:
+      // 1. [Install*] section Default= (Firefox's actual active profile path)
+      // 2. [Profile*] section with Default=1
+      // 3. [Profile0] fallback
+      let profilePath: string | null = null
+      let isRelative = true
+
+      // 1. Check [Install*] sections — these point to the actively-used profile
+      //    [Install*] Default= is always relative to profilesDir (no IsRelative key)
+      for (const [name, props] of Object.entries(sections)) {
+        if (name.startsWith('Install') && props['Default']) {
+          profilePath = props['Default']
+          isRelative = true
+          break
+        }
+      }
+
+      // 2. Fall back to section with Default=1
+      if (!profilePath) {
+        for (const [, props] of Object.entries(sections)) {
+          if (props['Default'] === '1' && props['Path']) {
+            profilePath = props['Path']
+            isRelative = props['IsRelative'] !== '0'
+            break
+          }
+        }
+      }
+
+      // 3. Fall back to Profile0
+      if (!profilePath && sections['Profile0']?.['Path']) {
+        profilePath = sections['Profile0']['Path']
+        isRelative = sections['Profile0']['IsRelative'] !== '0'
+      }
+
+      if (!profilePath) return null
+
+      const fullProfilePath = isRelative ? path.join(profilesDir, profilePath) : profilePath
+      const cookiesPath = path.join(fullProfilePath, 'cookies.sqlite')
+
+      // Verify file exists
+      await fs.access(cookiesPath)
+      return cookiesPath
+    } catch {
+      return null
+    }
+  }
+
+
+
+  let _sqlJs: any = null // cached sql.js WASM instance
+  let _cachedSessionKey: string | null = null
   let _sessionKeyCacheTime = 0
-  const TOKEN_CACHE_TTL = 10 * 60 * 1000     // 10 minutes
-  const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000 // 30 minutes
+  const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000
+  let _firefoxSkipUntil = 0
+
+  /** Extract sessionKey cookie from Firefox cookies.sqlite via sql.js (WASM) */
+  async function getSessionKeyFromFirefox(): Promise<string | null> {
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return _cachedSessionKey
+    }
+    if (now < _firefoxSkipUntil) {
+      return _cachedSessionKey // stale or null
+    }
+
+    const cookiesPath = await getFirefoxCookiePath()
+    if (!cookiesPath) return null
+
+    try {
+      if (!_sqlJs) {
+        const initSqlJs = (await import('sql.js')).default
+        _sqlJs = await initSqlJs()
+      }
+      const buf = await fs.readFile(cookiesPath)
+      const db = new _sqlJs.Database(new Uint8Array(buf))
+      try {
+        const result = db.exec(
+          "SELECT value FROM moz_cookies WHERE host LIKE '%claude.ai%' AND name = 'sessionKey' LIMIT 1"
+        )
+        if (result.length > 0 && result[0].values.length > 0) {
+          const value = String(result[0].values[0][0])
+          if (value) {
+            _cachedSessionKey = value
+            _sessionKeyCacheTime = now
+            logger.log('[usage] Extracted session key from Firefox (length:', value.length, ')')
+            return value
+          }
+        }
+        logger.log('[usage] Firefox cookies.sqlite found but no sessionKey cookie')
+        return null
+      } finally {
+        db.close()
+      }
+    } catch (e: unknown) {
+      const err = e as NodeJS.ErrnoException
+      if (err.code === 'EBUSY') {
+        _firefoxSkipUntil = now + 10 * 60 * 1000
+        logger.log('[usage] Firefox cookies.sqlite is locked (EBUSY), skipping for 10 min')
+        return _cachedSessionKey
+      }
+      logger.log('[usage] Firefox cookie read error:', err.message)
+      return null
+    }
+  }
+
+  let _cachedOrgId: string | null = null
+  let _orgIdCacheTime = 0
+  const ORG_ID_CACHE_TTL = 30 * 60 * 1000
+  let _orgIdForSessionKey: string | null = null
+
+  function getChromeUserAgent(): string {
+    if (process.platform === 'darwin') {
+      return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    if (process.platform === 'linux') {
+      return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  }
+
+  /** Fetch org ID from Claude API using session cookie */
+  async function getOrgId(sessionKey: string): Promise<string | null> {
+    const now = Date.now()
+    if (_cachedOrgId && now - _orgIdCacheTime < ORG_ID_CACHE_TTL && _orgIdForSessionKey === sessionKey) {
+      return _cachedOrgId
+    }
+    try {
+      const res = await fetch('https://claude.ai/api/organizations', {
+        headers: {
+          'Cookie': `sessionKey=${sessionKey}`,
+          'User-Agent': getChromeUserAgent(),
+          'Accept': 'application/json',
+        },
+      })
+
+      if (res.status === 401 || res.status === 403) {
+        _cachedSessionKey = null
+        _sessionKeyCacheTime = 0
+        _cachedOrgId = null
+        _orgIdCacheTime = 0
+        _orgIdForSessionKey = null
+        logger.log('[usage] [session] org fetch auth error', res.status, '— cleared caches')
+        return null
+      }
+
+      if (!res.ok) return null
+
+      const orgs = await res.json() as any[]
+      const uuid = orgs?.[0]?.uuid
+      if (!uuid) return null
+
+      _cachedOrgId = uuid
+      _orgIdCacheTime = now
+      _orgIdForSessionKey = sessionKey
+      return uuid
+    } catch (err) {
+      logger.log('[usage] [session] org fetch failed:', err)
+      return null
+    }
+  }
+
+  /** Fetch usage via Firefox session cookie (primary source) */
+  async function fetchUsageViaSessionKey(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null> {
+    const sessionKey = await getSessionKeyFromFirefox()
+    if (!sessionKey) return null
+
+    const orgId = await getOrgId(sessionKey)
+    if (!orgId) return null
+
+    try {
+      const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
+        headers: {
+          'Cookie': `sessionKey=${sessionKey}`,
+          'User-Agent': getChromeUserAgent(),
+          'Accept': 'application/json',
+        },
+      })
+
+      if (res.status === 401 || res.status === 403) {
+        _cachedSessionKey = null
+        _sessionKeyCacheTime = 0
+        _cachedOrgId = null
+        _orgIdCacheTime = 0
+        _orgIdForSessionKey = null
+        logger.log('[usage] [session] usage fetch auth error', res.status, '— cleared caches')
+        return null
+      }
+
+      if (!res.ok) return null
+
+      const data = await res.json() as any
+      logger.log('[usage] [session] 5h=', data.five_hour?.utilization, '7d=', data.seven_day?.utilization)
+      return {
+        fiveHour: data.five_hour?.utilization ?? null,
+        sevenDay: data.seven_day?.utilization ?? null,
+        fiveHourReset: data.five_hour?.resets_at ?? null,
+        sevenDayReset: data.seven_day?.resets_at ?? null,
+      }
+    } catch (err) {
+      logger.log('[usage] [session] usage fetch failed:', err)
+      return null
+    }
+  }
 
   async function getOAuthToken(): Promise<string | null> {
     const now = Date.now()
@@ -563,171 +821,8 @@ function registerProxiedHandlers() {
     } catch { return null }
   }
 
-  /** Decrypt a Chrome v10 encrypted cookie value on macOS */
-  function decryptChromeCookie(encHex: string, derivedKey: Buffer): string | null {
-    try {
-      const crypto = require('crypto')
-      const encBuf = Buffer.from(encHex, 'hex')
-      if (encBuf.length < 4 || encBuf.toString('utf-8', 0, 3) !== 'v10') return null
-      const ciphertext = encBuf.subarray(3)
-      const iv = Buffer.alloc(16, 0x20) // 16 space characters
-      const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv)
-      let dec = decipher.update(ciphertext)
-      dec = Buffer.concat([dec, decipher.final()])
-      return dec.toString('utf-8').replace(/[\x00-\x1f]/g, '').trim()
-    } catch { return null }
-  }
-
-  /** Extract session key and cf_clearance from Chrome cookies on macOS */
-  async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
-    if (process.platform !== 'darwin') return null
-    const now = Date.now()
-    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
-      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
-    }
-    try {
-      const crypto = await import('crypto')
-      const { execSync } = await import('child_process')
-      const os = await import('os')
-
-      // Copy Chrome cookies DB to temp to avoid WAL lock
-      const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
-      try { await fs.access(chromeCookiePath) } catch { return null }
-
-      const tmpDir = os.tmpdir()
-      const tmpDb = path.join(tmpDir, 'bat-chrome-cookies.db')
-      await fs.copyFile(chromeCookiePath, tmpDb)
-      // Also copy WAL and SHM files for consistency
-      try { await fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal') } catch { /* ok */ }
-      try { await fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm') } catch { /* ok */ }
-
-      // Get Chrome safe storage password from Keychain
-      const chromePassword = execSync(
-        'security find-generic-password -s "Chrome Safe Storage" -w 2>/dev/null',
-        { encoding: 'utf-8', timeout: 3000 }
-      ).trim()
-      if (!chromePassword) return null
-
-      const derivedKey = crypto.pbkdf2Sync(chromePassword, 'saltysalt', 1003, 16, 'sha1')
-
-      // Query sessionKey and cf_clearance
-      const rawOutput = execSync(
-        `sqlite3 "${tmpDb}" "SELECT name, hex(encrypted_value) FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance');"`,
-        { encoding: 'utf-8', timeout: 5000 }
-      ).trim()
-
-      // Clean up temp files
-      try { await fs.unlink(tmpDb) } catch { /* ok */ }
-      try { await fs.unlink(tmpDb + '-wal') } catch { /* ok */ }
-      try { await fs.unlink(tmpDb + '-shm') } catch { /* ok */ }
-
-      if (!rawOutput) return null
-
-      let sessionKey: string | null = null
-      let cfClearance: string | null = null
-
-      for (const line of rawOutput.split('\n')) {
-        const [name, hex] = line.split('|')
-        if (!hex) continue
-        const decrypted = decryptChromeCookie(hex, derivedKey as unknown as Buffer)
-        if (!decrypted) continue
-
-        // Strip non-ASCII chars from decrypted values
-        const cleaned = decrypted.replace(/[^\x20-\x7E]/g, '').trim()
-        if (name === 'sessionKey') {
-          // Decrypted value may have garbage prefix; extract from sk-ant-sid
-          const idx = cleaned.indexOf('sk-ant-sid')
-          sessionKey = idx >= 0 ? cleaned.substring(idx) : cleaned
-        } else if (name === 'cf_clearance') {
-          cfClearance = cleaned
-        }
-      }
-
-      if (!sessionKey || sessionKey.length < 10) return null
-
-      _cachedSessionKey = sessionKey
-      _cachedCfClearance = cfClearance
-      _sessionKeyCacheTime = now
-      logger.log('[usage] Extracted session key from Chrome (length:', sessionKey.length, ')')
-      return { sessionKey, cfClearance }
-    } catch (e) {
-      logger.error('[usage] Failed to extract Chrome session key:', e)
-      return null
-    }
-  }
-
-  /** Auto-detect organization ID using session key */
-  async function getOrgId(sessionKey: string, cfClearance: string | null): Promise<string | null> {
-    if (_cachedOrgId) return _cachedOrgId
-    try {
-      const cookieParts = [`sessionKey=${sessionKey}`]
-      if (cfClearance) cookieParts.push(`cf_clearance=${cfClearance}`)
-
-      const res = await fetch('https://claude.ai/api/organizations', {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Cookie': cookieParts.join('; '),
-        },
-      })
-      if (!res.ok) {
-        logger.error('[usage] Organizations API returned', res.status)
-        return null
-      }
-      const orgs = await res.json()
-      if (!Array.isArray(orgs) || orgs.length === 0) {
-        logger.error('[usage] No organizations found')
-        return null
-      }
-      _cachedOrgId = orgs[0].uuid
-      logger.log('[usage] Auto-detected org ID:', _cachedOrgId)
-      return _cachedOrgId
-    } catch (e) {
-      logger.error('[usage] getOrgId failed:', e)
-      return null
-    }
-  }
-
-  /** Fetch usage via session key (primary — lenient rate limits) */
-  async function fetchUsageViaSessionKey(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null> {
-    const creds = await getSessionKeyFromChrome()
-    if (!creds) return null
-    const orgId = await getOrgId(creds.sessionKey, creds.cfClearance)
-    if (!orgId) return null
-
-    const cookieParts = [`sessionKey=${creds.sessionKey}`]
-    if (creds.cfClearance) cookieParts.push(`cf_clearance=${creds.cfClearance}`)
-
-    const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Cookie': cookieParts.join('; '),
-      },
-    })
-
-    if (res.status === 401 || res.status === 403) {
-      _cachedSessionKey = null
-      _cachedOrgId = null
-      _cachedCfClearance = null
-      _sessionKeyCacheTime = 0
-      logger.log('[usage] Session key expired or blocked, will re-extract')
-      return null
-    }
-    if (!res.ok) return null
-
-    const data = await res.json()
-    logger.log('[usage] [session-key] 5h=', data.five_hour?.utilization, 'reset=', data.five_hour?.resets_at, '7d=', data.seven_day?.utilization, 'reset=', data.seven_day?.resets_at)
-    return {
-      fiveHour: data.five_hour?.utilization ?? null,
-      sevenDay: data.seven_day?.utilization ?? null,
-      fiveHourReset: data.five_hour?.resets_at ?? null,
-      sevenDayReset: data.seven_day?.resets_at ?? null,
-    }
-  }
-
-  /** Fetch usage via OAuth (fallback — strict rate limits) */
-  async function fetchUsageViaOAuth(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | 'rateLimited' | null> {
+  /** Fetch usage via OAuth usage endpoint */
+  async function fetchUsageViaOAuth(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | { rateLimited: true; retryAfterSec: number } | null> {
     const token = await getOAuthToken()
     if (!token) return null
 
@@ -740,7 +835,20 @@ function registerProxiedHandlers() {
       },
     })
 
-    if (res.status === 429) return 'rateLimited'
+    if (res.status === 429) {
+      const raw = parseInt(res.headers.get('retry-after') ?? '', 10)
+      const retryAfterSec = Number.isFinite(raw) && raw > 0 ? raw : 120
+      logger.log('[usage] [oauth] rate-limited, retry-after:', retryAfterSec, 's')
+      return { rateLimited: true, retryAfterSec }
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      _cachedOAuthToken = null
+      _tokenCacheTime = 0
+      logger.log('[usage] [oauth] auth error', res.status, '— cleared token cache')
+      return null
+    }
+
     if (!res.ok) return null
 
     const data = await res.json()
@@ -755,15 +863,13 @@ function registerProxiedHandlers() {
 
   registerHandler('claude:get-usage', async () => {
     try {
-      // Try session key first (lenient rate limits on claude.ai)
+      // Primary: Firefox session key (plaintext cookie, no decryption)
       const sessionResult = await fetchUsageViaSessionKey()
       if (sessionResult) return sessionResult
 
-      // Fall back to OAuth (strict rate limits on api.anthropic.com)
+      // Fallback: OAuth token
       const oauthResult = await fetchUsageViaOAuth()
-      if (oauthResult === 'rateLimited') {
-        return { rateLimited: true, retryAfterSec: 120 }
-      }
+      if (oauthResult && 'rateLimited' in oauthResult) return oauthResult
       return oauthResult
     } catch (e) {
       logger.error('[usage] get-usage failed:', e)
