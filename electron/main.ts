@@ -534,7 +534,7 @@ function registerProxiedHandlers() {
     try {
       let profilesDir: string
       if (process.platform === 'win32') {
-        profilesDir = path.join(process.env.APPDATA || '', 'Mozilla', 'Firefox')
+        profilesDir = path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Mozilla', 'Firefox')
       } else if (process.platform === 'darwin') {
         profilesDir = path.join(os.homedir(), 'Library', 'Application Support', 'Firefox')
       } else {
@@ -644,10 +644,14 @@ function registerProxiedHandlers() {
   let _cachedOrgId: string | null = null
   let _orgIdCacheTime = 0
   const ORG_ID_CACHE_TTL = 30 * 60 * 1000
+  let _orgIdForSessionKey: string | null = null
 
   function getChromeUserAgent(): string {
     if (process.platform === 'darwin') {
       return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    if (process.platform === 'linux') {
+      return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
     }
     return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
   }
@@ -655,7 +659,7 @@ function registerProxiedHandlers() {
   /** Fetch org ID from Claude API using session cookie */
   async function getOrgId(sessionKey: string): Promise<string | null> {
     const now = Date.now()
-    if (_cachedOrgId && now - _orgIdCacheTime < ORG_ID_CACHE_TTL) {
+    if (_cachedOrgId && now - _orgIdCacheTime < ORG_ID_CACHE_TTL && _orgIdForSessionKey === sessionKey) {
       return _cachedOrgId
     }
     try {
@@ -672,6 +676,7 @@ function registerProxiedHandlers() {
         _sessionKeyCacheTime = 0
         _cachedOrgId = null
         _orgIdCacheTime = 0
+        _orgIdForSessionKey = null
         logger.log('[usage] [session] org fetch auth error', res.status, '— cleared caches')
         return null
       }
@@ -684,6 +689,7 @@ function registerProxiedHandlers() {
 
       _cachedOrgId = uuid
       _orgIdCacheTime = now
+      _orgIdForSessionKey = sessionKey
       return uuid
     } catch (err) {
       logger.log('[usage] [session] org fetch failed:', err)
