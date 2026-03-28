@@ -559,17 +559,34 @@ function registerProxiedHandlers() {
         }
       }
 
-      // Find profile path: prefer section with Default=1, fall back to Profile0
+      // Find profile path priority:
+      // 1. [Install*] section Default= (Firefox's actual active profile path)
+      // 2. [Profile*] section with Default=1
+      // 3. [Profile0] fallback
       let profilePath: string | null = null
       let isRelative = true
 
-      for (const [, props] of Object.entries(sections)) {
-        if (props['Default'] === '1' && props['Path']) {
-          profilePath = props['Path']
+      // 1. Check [Install*] sections — these point to the actively-used profile
+      for (const [name, props] of Object.entries(sections)) {
+        if (name.startsWith('Install') && props['Default']) {
+          profilePath = props['Default']
           isRelative = props['IsRelative'] !== '0'
           break
         }
       }
+
+      // 2. Fall back to section with Default=1
+      if (!profilePath) {
+        for (const [, props] of Object.entries(sections)) {
+          if (props['Default'] === '1' && props['Path']) {
+            profilePath = props['Path']
+            isRelative = props['IsRelative'] !== '0'
+            break
+          }
+        }
+      }
+
+      // 3. Fall back to Profile0
       if (!profilePath && sections['Profile0']?.['Path']) {
         profilePath = sections['Profile0']['Path']
         isRelative = sections['Profile0']['IsRelative'] !== '0'
