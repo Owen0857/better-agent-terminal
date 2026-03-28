@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { TerminalInstance } from '../types'
 import { TerminalThumbnail } from './TerminalThumbnail'
@@ -10,6 +10,8 @@ interface ThumbnailBarProps {
   onFocus: (id: string) => void
   onAddTerminal?: () => void
   onAddClaudeAgent?: () => void
+  onAddClaudeAgent1M?: () => void
+  onAddTerminalWithCommand?: (command: string) => void
   onReorder?: (orderedIds: string[]) => void
   showAddButton: boolean
   height?: number
@@ -23,6 +25,8 @@ export function ThumbnailBar({
   onFocus,
   onAddTerminal,
   onAddClaudeAgent,
+  onAddClaudeAgent1M,
+  onAddTerminalWithCommand,
   onReorder,
   showAddButton,
   height,
@@ -41,20 +45,6 @@ export function ThumbnailBar({
   const [draggedId, setDraggedId] = useState<string | null>(null)
   const [dropTargetId, setDropTargetId] = useState<string | null>(null)
   const [dropPosition, setDropPosition] = useState<'before' | 'after'>('before')
-  const [showAddMenu, setShowAddMenu] = useState(false)
-  const addMenuRef = useRef<HTMLDivElement>(null)
-
-  // Close menu on outside click
-  useEffect(() => {
-    if (!showAddMenu) return
-    const handleClick = (e: MouseEvent) => {
-      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
-        setShowAddMenu(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [showAddMenu])
 
   const handleDragStart = useCallback((e: React.DragEvent, id: string) => {
     setDraggedId(id)
@@ -143,36 +133,25 @@ export function ThumbnailBar({
       <div className="thumbnail-bar-header">
         <span>{label}</span>
         <div className="thumbnail-bar-actions">
+          {onAddClaudeAgent && (
+            <button className="thumbnail-action-btn thumbnail-action-claude" onClick={onAddClaudeAgent} title="Claude Code (SDK Agent)">
+              ✦ Claude
+            </button>
+          )}
+          {onAddClaudeAgent1M && (
+            <button className="thumbnail-action-btn thumbnail-action-claude1m" onClick={onAddClaudeAgent1M} title="Claude Code (SDK Agent + 1M context)">
+              ✦ Claude 1M
+            </button>
+          )}
+          {onAddTerminalWithCommand && (
+            <button className="thumbnail-action-btn thumbnail-action-opus" onClick={() => onAddTerminalWithCommand('claude --model=opus[1m] --dangerously-skip-permissions')} title="Terminal: claude --model=opus[1m] --dangerously-skip-permissions">
+              Super Opus 1M
+            </button>
+          )}
           {onAddTerminal && (
-            <div className="thumbnail-add-wrapper" ref={addMenuRef}>
-              <button
-                className="thumbnail-add-btn"
-                onClick={() => setShowAddMenu(prev => !prev)}
-                title={t('terminal.addTerminalOrAgent')}
-              >
-                +
-              </button>
-              {showAddMenu && (
-                <div className="thumbnail-add-menu">
-                  <div
-                    className="thumbnail-add-menu-item"
-                    onClick={() => { onAddTerminal(); setShowAddMenu(false) }}
-                  >
-                    <span className="thumbnail-add-menu-icon">⌘</span>
-                    {t('terminal.terminalLabel')}
-                  </div>
-                  {onAddClaudeAgent && (
-                    <div
-                      className="thumbnail-add-menu-item"
-                      onClick={() => { onAddClaudeAgent(); setShowAddMenu(false) }}
-                    >
-                      <span className="thumbnail-add-menu-icon" style={{ color: '#d97706' }}>✦</span>
-                      Claude Code
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+            <button className="thumbnail-action-btn thumbnail-action-terminal" onClick={onAddTerminal} title="Terminal: claude (wait for enter)">
+              ⌘ Terminal
+            </button>
           )}
           {onCollapse && (
             <button className="thumbnail-collapse-btn" onClick={onCollapse} title={t('terminal.collapsePanel')}>
