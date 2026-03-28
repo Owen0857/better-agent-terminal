@@ -529,17 +529,44 @@ function registerProxiedHandlers() {
 
   // --- Firefox cookie-based usage polling (primary source) ---
 
-  /** Resolve Firefox default profile cookies.sqlite path cross-platform */
+  let _cachedCookiesPath: string | null | undefined = undefined // undefined = not yet resolved
+
+  /** Resolve Firefox default profile cookies.sqlite path cross-platform (cached on first call) */
   async function getFirefoxCookiePath(): Promise<string | null> {
+    if (_cachedCookiesPath !== undefined) return _cachedCookiesPath
+
     try {
-      let profilesDir: string
+      // Linux: try standard, Snap, Flatpak paths
+      const profilesDirs: string[] = []
       if (process.platform === 'win32') {
-        profilesDir = path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Mozilla', 'Firefox')
+        profilesDirs.push(path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Mozilla', 'Firefox'))
       } else if (process.platform === 'darwin') {
-        profilesDir = path.join(os.homedir(), 'Library', 'Application Support', 'Firefox')
+        profilesDirs.push(path.join(os.homedir(), 'Library', 'Application Support', 'Firefox'))
       } else {
-        profilesDir = path.join(os.homedir(), '.mozilla', 'firefox')
+        profilesDirs.push(path.join(os.homedir(), '.mozilla', 'firefox'))
+        profilesDirs.push(path.join(os.homedir(), 'snap', 'firefox', 'common', '.mozilla', 'firefox'))
+        profilesDirs.push(path.join(os.homedir(), '.var', 'app', 'org.mozilla.firefox', '.mozilla', 'firefox'))
       }
+
+      for (const profilesDir of profilesDirs) {
+        const result = await _resolveFirefoxProfile(profilesDir)
+        if (result) {
+          _cachedCookiesPath = result
+          logger.log('[usage] Firefox cookies.sqlite path:', result)
+          return result
+        }
+      }
+
+      _cachedCookiesPath = null
+      return null
+    } catch {
+      _cachedCookiesPath = null
+      return null
+    }
+  }
+
+  async function _resolveFirefoxProfile(profilesDir: string): Promise<string | null> {
+    try {
 
       const iniPath = path.join(profilesDir, 'profiles.ini')
       const iniContent = await fs.readFile(iniPath, 'utf-8')
@@ -567,10 +594,11 @@ function registerProxiedHandlers() {
       let isRelative = true
 
       // 1. Check [Install*] sections — these point to the actively-used profile
+      //    [Install*] Default= is always relative to profilesDir (no IsRelative key)
       for (const [name, props] of Object.entries(sections)) {
         if (name.startsWith('Install') && props['Default']) {
           profilePath = props['Default']
-          isRelative = props['IsRelative'] !== '0'
+          isRelative = true
           break
         }
       }
@@ -605,6 +633,9 @@ function registerProxiedHandlers() {
     }
   }
 
+
+
+  let _sqlJs: any = null // cached sql.js WASM instance
   let _cachedSessionKey: string | null = null
   let _sessionKeyCacheTime = 0
   const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000
@@ -624,10 +655,12 @@ function registerProxiedHandlers() {
     if (!cookiesPath) return null
 
     try {
-      const initSqlJs = (await import('sql.js')).default
-      const SQL = await initSqlJs()
+      if (!_sqlJs) {
+        const initSqlJs = (await import('sql.js')).default
+        _sqlJs = await initSqlJs()
+      }
       const buf = await fs.readFile(cookiesPath)
-      const db = new SQL.Database(new Uint8Array(buf))
+      const db = new _sqlJs.Database(new Uint8Array(buf))
       try {
         const result = db.exec(
           "SELECT value FROM moz_cookies WHERE host LIKE '%claude.ai%' AND name = 'sessionKey' LIMIT 1"
@@ -736,6 +769,7 @@ function registerProxiedHandlers() {
         _sessionKeyCacheTime = 0
         _cachedOrgId = null
         _orgIdCacheTime = 0
+        _orgIdForSessionKey = null
         logger.log('[usage] [session] usage fetch auth error', res.status, '— cleared caches')
         return null
       }
