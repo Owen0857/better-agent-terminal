@@ -605,33 +605,38 @@ function registerProxiedHandlers() {
     const cookiesPath = await getFirefoxCookiePath()
     if (!cookiesPath) return null
 
-    let db: any = null
     try {
       const initSqlJs = (await import('sql.js')).default
       const SQL = await initSqlJs()
       const buf = await fs.readFile(cookiesPath)
-      db = new SQL.Database(new Uint8Array(buf))
-      const result = db.exec(
-        "SELECT value FROM moz_cookies WHERE host LIKE '%claude.ai%' AND name = 'sessionKey' LIMIT 1"
-      )
-      if (result.length > 0 && result[0].values.length > 0) {
-        const value = result[0].values[0][0] as string
-        _cachedSessionKey = value
-        _sessionKeyCacheTime = now
-        logger.log(`[usage] Extracted session key from Firefox (length: ${value.length})`)
-        return value
+      const db = new SQL.Database(new Uint8Array(buf))
+      try {
+        const result = db.exec(
+          "SELECT value FROM moz_cookies WHERE host LIKE '%claude.ai%' AND name = 'sessionKey' LIMIT 1"
+        )
+        if (result.length > 0 && result[0].values.length > 0) {
+          const value = String(result[0].values[0][0])
+          if (value) {
+            _cachedSessionKey = value
+            _sessionKeyCacheTime = now
+            logger.log('[usage] Extracted session key from Firefox (length:', value.length, ')')
+            return value
+          }
+        }
+        logger.log('[usage] Firefox cookies.sqlite found but no sessionKey cookie')
+        return null
+      } finally {
+        db.close()
       }
-      return null
-    } catch (err: any) {
-      if (err?.code === 'EBUSY') {
+    } catch (e: unknown) {
+      const err = e as NodeJS.ErrnoException
+      if (err.code === 'EBUSY') {
         _firefoxSkipUntil = now + 10 * 60 * 1000
-        logger.log('[usage] Firefox cookies.sqlite EBUSY, skipping for 10 min')
+        logger.log('[usage] Firefox cookies.sqlite is locked (EBUSY), skipping for 10 min')
         return _cachedSessionKey
       }
-      logger.error('[usage] Firefox cookie extraction failed:', err)
+      logger.log('[usage] Firefox cookie read error:', err.message)
       return null
-    } finally {
-      if (db) db.close()
     }
   }
 
@@ -680,7 +685,7 @@ function registerProxiedHandlers() {
       _orgIdCacheTime = now
       return uuid
     } catch (err) {
-      logger.error('[usage] [session] org fetch failed:', err)
+      logger.log('[usage] [session] org fetch failed:', err)
       return null
     }
   }
@@ -722,7 +727,7 @@ function registerProxiedHandlers() {
         sevenDayReset: data.seven_day?.resets_at ?? null,
       }
     } catch (err) {
-      logger.error('[usage] [session] usage fetch failed:', err)
+      logger.log('[usage] [session] usage fetch failed:', err)
       return null
     }
   }
