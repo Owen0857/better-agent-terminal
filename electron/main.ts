@@ -443,13 +443,12 @@ function registerProxiedHandlers() {
   })
 
   // Claude Agent SDK
-  registerHandler('claude:start-session', (sessionId: string, options: { cwd: string; prompt?: string; permissionMode?: string; model?: string; effort?: string; enable1MContext?: boolean }) => claudeManager?.startSession(sessionId, options))
+  registerHandler('claude:start-session', (sessionId: string, options: { cwd: string; prompt?: string; permissionMode?: string; model?: string; effort?: string }) => claudeManager?.startSession(sessionId, options))
   registerHandler('claude:send-message', (sessionId: string, prompt: string, images?: string[]) => claudeManager?.sendMessage(sessionId, prompt, images))
   registerHandler('claude:stop-session', (sessionId: string) => claudeManager?.stopSession(sessionId))
   registerHandler('claude:set-permission-mode', (sessionId: string, mode: string) => claudeManager?.setPermissionMode(sessionId, mode as import('@anthropic-ai/claude-agent-sdk').PermissionMode))
   registerHandler('claude:set-model', (sessionId: string, model: string) => claudeManager?.setModel(sessionId, model))
   registerHandler('claude:set-effort', (sessionId: string, effort: string) => claudeManager?.setEffort(sessionId, effort as 'low' | 'medium' | 'high' | 'max'))
-  registerHandler('claude:set-1m-context', (sessionId: string, enable: boolean) => claudeManager?.set1MContext(sessionId, enable))
   registerHandler('claude:reset-session', (sessionId: string) => claudeManager?.resetSession(sessionId))
   registerHandler('claude:get-supported-models', (sessionId: string) => claudeManager?.getSupportedModels(sessionId))
   registerHandler('claude:get-account-info', (sessionId: string) => claudeManager?.getAccountInfo(sessionId))
@@ -488,7 +487,7 @@ function registerProxiedHandlers() {
   registerHandler('claude:resolve-permission', (sessionId: string, toolUseId: string, result: { behavior: string; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[]; message?: string; dontAskAgain?: boolean }) => claudeManager?.resolvePermission(sessionId, toolUseId, result))
   registerHandler('claude:resolve-ask-user', (sessionId: string, toolUseId: string, answers: Record<string, string>) => claudeManager?.resolveAskUser(sessionId, toolUseId, answers))
   registerHandler('claude:list-sessions', (cwd: string) => claudeManager?.listSessions(cwd))
-  registerHandler('claude:resume-session', (sessionId: string, sdkSessionId: string, cwd: string, model?: string, enable1MContext?: boolean) => claudeManager?.resumeSession(sessionId, sdkSessionId, cwd, model, enable1MContext))
+  registerHandler('claude:resume-session', (sessionId: string, sdkSessionId: string, cwd: string, model?: string) => claudeManager?.resumeSession(sessionId, sdkSessionId, cwd, model))
   registerHandler('claude:fork-session', (sessionId: string) => claudeManager?.forkSession(sessionId))
   registerHandler('claude:stop-task', (sessionId: string, taskId: string) => claudeManager?.stopTask(sessionId, taskId))
   registerHandler('claude:rest-session', (sessionId: string) => claudeManager?.restSession(sessionId))
@@ -523,7 +522,7 @@ function registerProxiedHandlers() {
   })
 
   // Claude usage (5h / 7d rate limits)
-  // Primary: session key from Chrome cookies (lenient rate limits on claude.ai)
+  // Primary: session key from Chrome/Edge cookies (lenient rate limits on claude.ai)
   // Fallback: OAuth token from Claude Code credentials (strict rate limits on api.anthropic.com)
   let _cachedOAuthToken: string | null = null
   let _cachedSessionKey: string | null = null
@@ -531,11 +530,344 @@ function registerProxiedHandlers() {
   let _cachedCfClearance: string | null = null
   let _tokenCacheTime = 0
   let _sessionKeyCacheTime = 0
-  const TOKEN_CACHE_TTL = 10 * 60 * 1000     // 10 minutes
-  const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000 // 30 minutes
-  let _chromeWinMasterKey: Buffer | null = null // Windows only: AES-256 key from Chrome Local State
+  const TOKEN_CACHE_TTL = 10 * 60 * 1000
+  const SESSION_KEY_CACHE_TTL = 30 * 60 * 1000
+  let _chromeWinMasterKey: Buffer | null = null
+  let _edgeWinMasterKey: Buffer | null = null
+  let _chromeWinSkipUntil = 0
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let _sqlJsInstance: any | null = null        // Windows only: cached sql.js WASM instance
+  let _sqlJsInstance: any | null = null
+
+  function getLocalAppData(): string {
+    return process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const execFileAsync: (file: string, args: string[], options: object) => Promise<{ stdout: string }> =
+    require('util').promisify(require('child_process').execFile)
+
+  /** DPAPI decrypt via PowerShell (async, non-blocking) */
+  async function dpapiDecrypt(hexData: string): Promise<Buffer | null> {
+    if (!/^[0-9A-Fa-f]+$/.test(hexData) || hexData.length === 0 || hexData.length % 2 !== 0) return null
+    const script =
+      `Add-Type -AssemblyName System.Security;` +
+      `$b=[byte[]]-split('${hexData}'-replace'..','0x$& ');` +
+      `$p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser');` +
+      `($p|%{$_.ToString('x2')})-join''`
+    try {
+      const { stdout } = await execFileAsync('powershell', [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script
+      ], { encoding: 'utf-8', timeout: 10000 })
+      const hex = stdout.trim()
+      if (!hex || !/^[0-9a-f]+$/.test(hex)) return null
+      return Buffer.from(hex, 'hex')
+    } catch { return null }
+  }
+
+  /** Read AES-256 master key from a Chromium-family browser's Local State (DPAPI-protected) */
+  async function getWinBrowserMasterKey(localStatePath: string): Promise<Buffer | null> {
+    try {
+      const raw = await fs.readFile(localStatePath, 'utf-8')
+      const localState = JSON.parse(raw)
+      const encKeyB64: string | undefined = localState?.os_crypt?.encrypted_key
+      if (!encKeyB64) return null
+      const encKeyWithPrefix = Buffer.from(encKeyB64, 'base64')
+      const prefix = encKeyWithPrefix.subarray(0, 5).toString('ascii')
+      if (prefix === 'APPB') {
+        logger.log('[usage] Browser Local State key uses App-Bound Encryption (APPB) — DPAPI unavailable')
+        return null
+      }
+      if (prefix !== 'DPAPI') return null
+      const masterKey = await dpapiDecrypt(encKeyWithPrefix.subarray(5).toString('hex'))
+      if (!masterKey || masterKey.length !== 32) return null
+      return masterKey
+    } catch { return null }
+  }
+
+  async function getChromeWinMasterKey(): Promise<Buffer | null> {
+    if (_chromeWinMasterKey) return _chromeWinMasterKey
+    const key = await getWinBrowserMasterKey(
+      path.join(getLocalAppData(), 'Google', 'Chrome', 'User Data', 'Local State')
+    )
+    if (key) _chromeWinMasterKey = key
+    return key
+  }
+
+  async function getEdgeWinMasterKey(): Promise<Buffer | null> {
+    if (_edgeWinMasterKey) return _edgeWinMasterKey
+    const key = await getWinBrowserMasterKey(
+      path.join(getLocalAppData(), 'Microsoft', 'Edge', 'User Data', 'Local State')
+    )
+    if (key) _edgeWinMasterKey = key
+    return key
+  }
+
+  /** Decrypt AES-256-GCM (Scheme B / v10) Chrome cookie value on Windows */
+  function decryptChromeWinSchemeB(encBuf: Buffer, masterKey: Buffer): string | null {
+    try {
+      if (encBuf.length < 3 + 12 + 1 + 16) return null
+      if (encBuf[0] !== 0x76 || encBuf[1] !== 0x31 || encBuf[2] !== 0x30) return null
+      const nonce = encBuf.subarray(3, 15)
+      const tag = encBuf.subarray(encBuf.length - 16)
+      const ciphertext = encBuf.subarray(15, encBuf.length - 16)
+      const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, nonce)
+      decipher.setAuthTag(tag)
+      const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+      return dec.toString('utf-8').replace(/[^\x20-\x7E]/g, '').trim()
+    } catch { return null }
+  }
+
+  /** Extract session key from Chrome cookies on Windows */
+  async function getSessionKeyFromChromeWin(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
+    }
+    if (now < _chromeWinSkipUntil) return null
+    try {
+      const cookiePath = path.join(getLocalAppData(), 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies')
+      const masterKey = await getChromeWinMasterKey()
+      if (!masterKey) { _chromeWinSkipUntil = now + 30 * 60 * 1000; return null }
+      if (!_sqlJsInstance) {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        _sqlJsInstance = await require('sql.js')()
+      }
+      const fileBuffer = await fs.readFile(cookiePath)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+      const db = new _sqlJsInstance.Database(fileBuffer)
+      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
+      try {
+        const result = db.exec(
+          `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
+        )
+        rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
+          name, encrypted_value: Buffer.from(encVal)
+        }))
+      } finally { db.close() }
+
+      let sessionKey: string | null = null
+      let cfClearance: string | null = null
+      let hasV20 = false
+      for (const row of rows) {
+        const buf = row.encrypted_value
+        if (buf.length >= 3 && buf[0] === 0x76 && buf[1] === 0x32 && buf[2] === 0x30) {
+          hasV20 = true; continue
+        }
+        const decrypted = decryptChromeWinSchemeB(buf, masterKey)
+        if (!decrypted) continue
+        if (row.name === 'sessionKey') {
+          const idx = decrypted.indexOf('sk-ant-sid')
+          sessionKey = idx >= 0 ? decrypted.substring(idx) : decrypted
+        } else if (row.name === 'cf_clearance') { cfClearance = decrypted }
+      }
+      if (!sessionKey || sessionKey.length < 10) {
+        if (hasV20) {
+          logger.log('[usage] Chrome sessionKey is v20 (App-Bound Encryption) — will try Edge')
+          _chromeWinSkipUntil = now + 30 * 60 * 1000
+        }
+        return null
+      }
+      _cachedSessionKey = sessionKey; _cachedCfClearance = cfClearance; _sessionKeyCacheTime = now
+      logger.log('[usage] Extracted session key from Chrome/Win (length:', sessionKey.length, ')')
+      return { sessionKey, cfClearance }
+    } catch (e) {
+      _chromeWinSkipUntil = now + 10 * 60 * 1000
+      logger.error('[usage] Failed to extract Chrome/Win session key:', e)
+      return null
+    }
+  }
+
+  /** Extract session key from Edge cookies on Windows */
+  async function getSessionKeyFromEdgeWin(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
+    }
+    try {
+      const cookiePath = path.join(getLocalAppData(), 'Microsoft', 'Edge', 'User Data', 'Default', 'Network', 'Cookies')
+      const masterKey = await getEdgeWinMasterKey()
+      if (!masterKey) return null
+      if (!_sqlJsInstance) {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        _sqlJsInstance = await require('sql.js')()
+      }
+      const fileBuffer = await fs.readFile(cookiePath)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+      const db = new _sqlJsInstance.Database(fileBuffer)
+      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
+      try {
+        const result = db.exec(
+          `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
+        )
+        rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
+          name, encrypted_value: Buffer.from(encVal)
+        }))
+      } finally { db.close() }
+
+      let sessionKey: string | null = null
+      let cfClearance: string | null = null
+      for (const row of rows) {
+        const decrypted = decryptChromeWinSchemeB(row.encrypted_value, masterKey)
+        if (!decrypted) continue
+        if (row.name === 'sessionKey') {
+          const idx = decrypted.indexOf('sk-ant-sid')
+          sessionKey = idx >= 0 ? decrypted.substring(idx) : decrypted
+        } else if (row.name === 'cf_clearance') { cfClearance = decrypted }
+      }
+      if (!sessionKey || sessionKey.length < 10) return null
+      _cachedSessionKey = sessionKey; _cachedCfClearance = cfClearance; _sessionKeyCacheTime = now
+      logger.log('[usage] Extracted session key from Edge/Win (length:', sessionKey.length, ')')
+      return { sessionKey, cfClearance }
+    } catch (e) {
+      logger.error('[usage] Failed to extract Edge/Win session key:', e)
+      return null
+    }
+  }
+
+  /** Decrypt Chrome v10 AES-128-CBC cookie on macOS */
+  function decryptChromeCookieMac(encBuf: Buffer, derivedKey: Buffer): string | null {
+    try {
+      if (encBuf.length < 4 || encBuf.toString('utf-8', 0, 3) !== 'v10') return null
+      const ciphertext = encBuf.subarray(3)
+      const iv = Buffer.alloc(16, 0x20)
+      const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv)
+      let dec = decipher.update(ciphertext)
+      dec = Buffer.concat([dec, decipher.final()])
+      return dec.toString('utf-8').replace(/[\x00-\x1f]/g, '').trim()
+    } catch { return null }
+  }
+
+  /** Extract session key from Chrome cookies on macOS */
+  async function getSessionKeyFromChromeMac(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    if (process.platform !== 'darwin') return null
+    const now = Date.now()
+    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
+      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
+    }
+    try {
+      const { execSync } = await import('child_process')
+      const chromePassword = execSync(
+        'security find-generic-password -s "Chrome Safe Storage" -w 2>/dev/null',
+        { encoding: 'utf-8', timeout: 3000 }
+      ).trim()
+      if (!chromePassword) return null
+      const derivedKey = crypto.pbkdf2Sync(chromePassword, 'saltysalt', 1003, 16, 'sha1')
+      const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
+      if (!_sqlJsInstance) {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        _sqlJsInstance = await require('sql.js')()
+      }
+      const fileBuffer = await fs.readFile(chromeCookiePath)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+      const db = new _sqlJsInstance.Database(fileBuffer)
+      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
+      try {
+        const result = db.exec(
+          `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
+        )
+        rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
+          name, encrypted_value: Buffer.from(encVal)
+        }))
+      } finally { db.close() }
+
+      let sessionKey: string | null = null
+      let cfClearance: string | null = null
+      for (const row of rows) {
+        const decrypted = decryptChromeCookieMac(row.encrypted_value, derivedKey)
+        if (!decrypted) continue
+        const cleaned = decrypted.replace(/[^\x20-\x7E]/g, '').trim()
+        if (row.name === 'sessionKey') {
+          const idx = cleaned.indexOf('sk-ant-sid')
+          sessionKey = idx >= 0 ? cleaned.substring(idx) : cleaned
+        } else if (row.name === 'cf_clearance') { cfClearance = cleaned }
+      }
+      if (!sessionKey || sessionKey.length < 10) return null
+      _cachedSessionKey = sessionKey; _cachedCfClearance = cfClearance; _sessionKeyCacheTime = now
+      logger.log('[usage] Extracted session key from Chrome/Mac (length:', sessionKey.length, ')')
+      return { sessionKey, cfClearance }
+    } catch (e) {
+      logger.error('[usage] Failed to extract Chrome/Mac session key:', e)
+      return null
+    }
+  }
+
+  function getChromeUserAgent(): string {
+    if (process.platform === 'win32') {
+      return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  }
+
+  async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
+    if (process.platform === 'darwin') return getSessionKeyFromChromeMac()
+    if (process.platform === 'win32') {
+      return await getSessionKeyFromChromeWin() ?? await getSessionKeyFromEdgeWin()
+    }
+    return null
+  }
+
+  async function getOrgId(sessionKey: string, cfClearance: string | null): Promise<string | null> {
+    if (_cachedOrgId) return _cachedOrgId
+    try {
+      const cookieParts = [`sessionKey=${sessionKey}`]
+      if (cfClearance) cookieParts.push(`cf_clearance=${cfClearance}`)
+      const res = await fetch('https://claude.ai/api/organizations', {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': getChromeUserAgent(),
+          'Cookie': cookieParts.join('; '),
+        },
+      })
+      if (!res.ok) {
+        logger.error('[usage] Organizations API returned', res.status)
+        if (res.status === 401 || res.status === 403) {
+          _cachedSessionKey = null; _cachedCfClearance = null; _sessionKeyCacheTime = 0
+          _chromeWinMasterKey = null; _edgeWinMasterKey = null; _chromeWinSkipUntil = 0
+        }
+        return null
+      }
+      const orgs = await res.json()
+      if (!Array.isArray(orgs) || orgs.length === 0) return null
+      _cachedOrgId = orgs[0].uuid
+      logger.log('[usage] Auto-detected org ID:', _cachedOrgId)
+      return _cachedOrgId
+    } catch (e) {
+      logger.error('[usage] getOrgId failed:', e)
+      return null
+    }
+  }
+
+  /** Fetch usage via session key (primary — lenient rate limits) */
+  async function fetchUsageViaSessionKey(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null> {
+    const creds = await getSessionKeyFromChrome()
+    if (!creds) return null
+    const orgId = await getOrgId(creds.sessionKey, creds.cfClearance)
+    if (!orgId) return null
+    const cookieParts = [`sessionKey=${creds.sessionKey}`]
+    if (creds.cfClearance) cookieParts.push(`cf_clearance=${creds.cfClearance}`)
+    const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getChromeUserAgent(),
+        'Cookie': cookieParts.join('; '),
+      },
+    })
+    if (res.status === 401 || res.status === 403) {
+      _cachedSessionKey = null; _cachedOrgId = null; _cachedCfClearance = null; _sessionKeyCacheTime = 0
+      _chromeWinMasterKey = null; _edgeWinMasterKey = null; _chromeWinSkipUntil = 0
+      logger.log('[usage] Session key expired — cleared caches')
+      return null
+    }
+    if (!res.ok) return null
+    const data = await res.json()
+    logger.log('[usage] [session-key] 5h=', data.five_hour?.utilization, '7d=', data.seven_day?.utilization)
+    return {
+      fiveHour: data.five_hour?.utilization ?? null,
+      sevenDay: data.seven_day?.utilization ?? null,
+      fiveHourReset: data.five_hour?.resets_at ?? null,
+      sevenDayReset: data.seven_day?.resets_at ?? null,
+    }
+  }
 
   async function getOAuthToken(): Promise<string | null> {
     const now = Date.now()
@@ -568,339 +900,7 @@ function registerProxiedHandlers() {
     } catch { return null }
   }
 
-  /** Decrypt a Chrome v10 AES-128-CBC cookie value on macOS */
-  function decryptChromeCookieMac(encBuf: Buffer, derivedKey: Buffer): string | null {
-    try {
-      if (encBuf.length < 4 || encBuf.toString('utf-8', 0, 3) !== 'v10') return null
-      const ciphertext = encBuf.subarray(3)
-      const iv = Buffer.alloc(16, 0x20) // 16 space characters — Chrome's fixed IV for AES-128-CBC
-      const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv)
-      let dec = decipher.update(ciphertext)
-      dec = Buffer.concat([dec, decipher.final()])
-      return dec.toString('utf-8').replace(/[\x00-\x1f]/g, '').trim()
-    } catch { return null }
-  }
-
-  /** Extract session key and cf_clearance from Chrome cookies on macOS (sql.js — no sqlite3 CLI dep) */
-  async function getSessionKeyFromChromeMac(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
-    if (process.platform !== 'darwin') return null
-    const now = Date.now()
-    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
-      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
-    }
-    try {
-      const { execSync } = await import('child_process')
-
-      // Get Chrome safe storage password from Keychain
-      const chromePassword = execSync(
-        'security find-generic-password -s "Chrome Safe Storage" -w 2>/dev/null',
-        { encoding: 'utf-8', timeout: 3000 }
-      ).trim()
-      if (!chromePassword) return null
-
-      const derivedKey = crypto.pbkdf2Sync(chromePassword, 'saltysalt', 1003, 16, 'sha1')
-
-      // Copy Chrome cookies DB to temp to avoid WAL lock
-      const chromeCookiePath = path.join(app.getPath('home'), 'Library/Application Support/Google/Chrome/Default/Cookies')
-      const tmpDb = path.join(os.tmpdir(), `bat-chrome-${crypto.randomBytes(4).toString('hex')}.db`)
-      await fs.copyFile(chromeCookiePath, tmpDb)
-      await Promise.allSettled([
-        fs.copyFile(chromeCookiePath + '-wal', tmpDb + '-wal'),
-        fs.copyFile(chromeCookiePath + '-shm', tmpDb + '-shm'),
-      ])
-
-      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
-      try {
-        // sql.js is pure WASM — no sqlite3 CLI dependency, no Electron ABI issues
-        // reuse cached instance to avoid re-compiling WASM on every call
-        if (!_sqlJsInstance) {
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          _sqlJsInstance = await require('sql.js')()
-        }
-        const fileBuffer = await fs.readFile(tmpDb)
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-        const db = new _sqlJsInstance.Database(fileBuffer)
-        try {
-          const result = db.exec(
-            `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
-          )
-          rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
-            name,
-            encrypted_value: Buffer.from(encVal)
-          }))
-        } finally {
-          db.close()
-        }
-      } finally {
-        await Promise.allSettled([
-          fs.unlink(tmpDb),
-          fs.unlink(tmpDb + '-wal'),
-          fs.unlink(tmpDb + '-shm'),
-        ])
-      }
-
-      let sessionKey: string | null = null
-      let cfClearance: string | null = null
-
-      for (const row of rows) {
-        const decrypted = decryptChromeCookieMac(row.encrypted_value, derivedKey)
-        if (!decrypted) continue
-        const cleaned = decrypted.replace(/[^\x20-\x7E]/g, '').trim()
-        if (row.name === 'sessionKey') {
-          // Decrypted value may have garbage prefix; extract from sk-ant-sid
-          const idx = cleaned.indexOf('sk-ant-sid')
-          sessionKey = idx >= 0 ? cleaned.substring(idx) : cleaned
-        } else if (row.name === 'cf_clearance') {
-          cfClearance = cleaned
-        }
-      }
-
-      if (!sessionKey || sessionKey.length < 10) return null
-
-      _cachedSessionKey = sessionKey
-      _cachedCfClearance = cfClearance
-      _sessionKeyCacheTime = now
-      logger.log('[usage] Extracted session key from Chrome (length:', sessionKey.length, ')')
-      return { sessionKey, cfClearance }
-    } catch (e) {
-      logger.error('[usage] Failed to extract Chrome session key:', e)
-      return null
-    }
-  }
-
-  function getLocalAppData(): string {
-    return process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
-  }
-
-  /** DPAPI decrypt via PowerShell (async, non-blocking) — returns decrypted Buffer or null */
-  async function dpapiDecrypt(hexData: string): Promise<Buffer | null> {
-    if (!/^[0-9A-Fa-f]+$/.test(hexData) || hexData.length === 0 || hexData.length % 2 !== 0) return null
-    // hex is validated to [0-9A-Fa-f] — no injection risk embedding inline
-    const script =
-      `Add-Type -AssemblyName System.Security;` +
-      `$b=[byte[]]-split('${hexData}'-replace'..','0x$& ');` +
-      `$p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser');` +
-      `($p|%{$_.ToString('x2')})-join''`
-    try {
-      const { stdout } = await execFileAsync('powershell', [
-        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script
-      ], { encoding: 'utf-8', timeout: 10000 })
-      const hex = stdout.trim()
-      if (!hex || !/^[0-9a-f]+$/.test(hex)) return null
-      return Buffer.from(hex, 'hex')
-    } catch { return null }
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const execFileAsync: (file: string, args: string[], options: object) => Promise<{ stdout: string }> =
-    require('util').promisify(require('child_process').execFile)
-
-  /** Read AES-256 master key from Chrome Local State and DPAPI-decrypt it */
-  async function getChromeWinMasterKey(): Promise<Buffer | null> {
-    if (_chromeWinMasterKey) return _chromeWinMasterKey
-    try {
-      const localStatePath = path.join(getLocalAppData(), 'Google', 'Chrome', 'User Data', 'Local State')
-      const raw = await fs.readFile(localStatePath, 'utf-8')
-      const localState = JSON.parse(raw)
-      const encKeyB64: string | undefined = localState?.os_crypt?.encrypted_key
-      if (!encKeyB64) return null
-      const encKeyWithPrefix = Buffer.from(encKeyB64, 'base64')
-      // Chrome prepends "DPAPI" before storing the DPAPI-encrypted key in Local State
-      // so the payload doesn't look like arbitrary binary to policy scanners
-      if (encKeyWithPrefix.subarray(0, 5).toString('ascii') !== 'DPAPI') return null
-      const masterKey = await dpapiDecrypt(encKeyWithPrefix.subarray(5).toString('hex'))
-      if (!masterKey || masterKey.length !== 32) return null
-      _chromeWinMasterKey = masterKey
-      return masterKey
-    } catch { return null }
-  }
-
-  /** Decrypt AES-256-GCM (Scheme B / v10) Chrome cookie value on Windows */
-  function decryptChromeWinSchemeB(encBuf: Buffer, masterKey: Buffer): string | null {
-    try {
-      // Chromium "Scheme B" layout (Chromium 80+, os_crypt_win.cc):
-      // [v10 magic (3)] [GCM nonce (12)] [ciphertext] [GCM auth tag (16)]
-      if (encBuf.length < 3 + 12 + 1 + 16) return null
-      if (encBuf[0] !== 0x76 || encBuf[1] !== 0x31 || encBuf[2] !== 0x30) return null
-      const nonce = encBuf.subarray(3, 15)
-      const tag = encBuf.subarray(encBuf.length - 16)
-      const ciphertext = encBuf.subarray(15, encBuf.length - 16)
-      const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, nonce)
-      decipher.setAuthTag(tag)
-      const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()])
-      return dec.toString('utf-8').replace(/[^\x20-\x7E]/g, '').trim()
-    } catch { return null }
-  }
-
-  /** Extract session key and cf_clearance from Chrome cookies on Windows */
-  async function getSessionKeyFromChromeWin(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
-    const now = Date.now()
-    if (_cachedSessionKey && now - _sessionKeyCacheTime < SESSION_KEY_CACHE_TTL) {
-      return { sessionKey: _cachedSessionKey, cfClearance: _cachedCfClearance }
-    }
-    try {
-      const cookiePath = path.join(getLocalAppData(), 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies')
-      const masterKey = await getChromeWinMasterKey()
-      if (!masterKey) return null
-
-      const tmpDb = path.join(os.tmpdir(), `bat-chrome-${crypto.randomBytes(4).toString('hex')}.db`)
-      await fs.copyFile(cookiePath, tmpDb)
-      await Promise.allSettled([
-        fs.copyFile(cookiePath + '-wal', tmpDb + '-wal'),
-        fs.copyFile(cookiePath + '-shm', tmpDb + '-shm'),
-      ])
-
-      let rows: Array<{ name: string; encrypted_value: Buffer }> = []
-      try {
-        // sql.js is pure WASM — no native module, no Electron ABI issues
-        // reuse cached instance to avoid re-compiling WASM on every call
-        if (!_sqlJsInstance) {
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          _sqlJsInstance = await require('sql.js')()
-        }
-        const fileBuffer = await fs.readFile(tmpDb)
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-        const db = new _sqlJsInstance.Database(fileBuffer)
-        try {
-          const result = db.exec(
-            `SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude.ai%' AND name IN ('sessionKey','cf_clearance')`
-          )
-          rows = (result[0]?.values ?? []).map(([name, encVal]: [string, Uint8Array]) => ({
-            name,
-            encrypted_value: Buffer.from(encVal)
-          }))
-        } finally {
-          db.close()
-        }
-      } finally {
-        await Promise.allSettled([
-          fs.unlink(tmpDb),
-          fs.unlink(tmpDb + '-wal'),
-          fs.unlink(tmpDb + '-shm'),
-        ])
-      }
-
-      let sessionKey: string | null = null
-      let cfClearance: string | null = null
-      for (const row of rows) {
-        const decrypted = decryptChromeWinSchemeB(row.encrypted_value, masterKey)
-        if (!decrypted) continue
-        if (row.name === 'sessionKey') {
-          const idx = decrypted.indexOf('sk-ant-sid')
-          sessionKey = idx >= 0 ? decrypted.substring(idx) : decrypted
-        } else if (row.name === 'cf_clearance') {
-          cfClearance = decrypted
-        }
-      }
-
-      if (!sessionKey || sessionKey.length < 10) return null
-      _cachedSessionKey = sessionKey
-      _cachedCfClearance = cfClearance
-      _sessionKeyCacheTime = now
-      logger.log('[usage] Extracted session key from Chrome/Win (length:', sessionKey.length, ')')
-      return { sessionKey, cfClearance }
-    } catch (e) {
-      logger.error('[usage] Failed to extract Chrome/Win session key:', e)
-      return null
-    }
-  }
-
-  /** Chrome User-Agent matching the platform where the cookie was issued */
-  function getChromeUserAgent(): string {
-    if (process.platform === 'win32') {
-      return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-    }
-    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-  }
-
-  /** Dispatch to platform-specific Chrome session key extraction */
-  async function getSessionKeyFromChrome(): Promise<{ sessionKey: string; cfClearance: string | null } | null> {
-    if (process.platform === 'darwin') return getSessionKeyFromChromeMac()
-    if (process.platform === 'win32') return getSessionKeyFromChromeWin()
-    return null
-  }
-
-  /** Auto-detect organization ID using session key */
-  async function getOrgId(sessionKey: string, cfClearance: string | null): Promise<string | null> {
-    if (_cachedOrgId) return _cachedOrgId
-    try {
-      const cookieParts = [`sessionKey=${sessionKey}`]
-      if (cfClearance) cookieParts.push(`cf_clearance=${cfClearance}`)
-
-      const res = await fetch('https://claude.ai/api/organizations', {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': getChromeUserAgent(),
-          'Cookie': cookieParts.join('; '),
-        },
-      })
-      if (!res.ok) {
-        logger.error('[usage] Organizations API returned', res.status)
-        if (res.status === 401 || res.status === 403) {
-          // Session key is invalid — clear all session caches so next poll re-extracts
-          _cachedSessionKey = null
-          _cachedCfClearance = null
-          _sessionKeyCacheTime = 0
-          _chromeWinMasterKey = null
-          logger.log('[usage] org auth error', res.status, '— cleared session caches')
-        }
-        return null
-      }
-      const orgs = await res.json()
-      if (!Array.isArray(orgs) || orgs.length === 0) {
-        logger.error('[usage] No organizations found')
-        return null
-      }
-      _cachedOrgId = orgs[0].uuid
-      logger.log('[usage] Auto-detected org ID:', _cachedOrgId)
-      return _cachedOrgId
-    } catch (e) {
-      logger.error('[usage] getOrgId failed:', e)
-      return null
-    }
-  }
-
-  /** Fetch usage via session key (primary — lenient rate limits) */
-  async function fetchUsageViaSessionKey(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | null> {
-    const creds = await getSessionKeyFromChrome()
-    if (!creds) return null
-    const orgId = await getOrgId(creds.sessionKey, creds.cfClearance)
-    if (!orgId) return null
-
-    const cookieParts = [`sessionKey=${creds.sessionKey}`]
-    if (creds.cfClearance) cookieParts.push(`cf_clearance=${creds.cfClearance}`)
-
-    const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': getChromeUserAgent(),
-        'Cookie': cookieParts.join('; '),
-      },
-    })
-
-    if (res.status === 401 || res.status === 403) {
-      _cachedSessionKey = null
-      _cachedOrgId = null
-      _cachedCfClearance = null
-      _sessionKeyCacheTime = 0
-      // master key may have rotated — force re-read from Local State on next attempt
-      _chromeWinMasterKey = null
-      logger.log('[usage] Session key expired or blocked, will re-extract')
-      return null
-    }
-    if (!res.ok) return null
-
-    const data = await res.json()
-    logger.log('[usage] [session-key] 5h=', data.five_hour?.utilization, 'reset=', data.five_hour?.resets_at, '7d=', data.seven_day?.utilization, 'reset=', data.seven_day?.resets_at)
-    return {
-      fiveHour: data.five_hour?.utilization ?? null,
-      sevenDay: data.seven_day?.utilization ?? null,
-      fiveHourReset: data.five_hour?.resets_at ?? null,
-      sevenDayReset: data.seven_day?.resets_at ?? null,
-    }
-  }
-
-  /** Fetch usage via OAuth (fallback — strict rate limits) */
+  /** Fetch usage via OAuth usage endpoint */
   async function fetchUsageViaOAuth(): Promise<{ fiveHour: number | null; sevenDay: number | null; fiveHourReset: string | null; sevenDayReset: string | null } | { rateLimited: true; retryAfterSec: number } | null> {
     const token = await getOAuthToken()
     if (!token) return null
@@ -915,14 +915,12 @@ function registerProxiedHandlers() {
     })
 
     if (res.status === 429) {
-      // Read actual Retry-After from server instead of assuming 120s
       const raw = parseInt(res.headers.get('retry-after') ?? '', 10)
       const retryAfterSec = Number.isFinite(raw) && raw > 0 ? raw : 120
       logger.log('[usage] [oauth] rate-limited, retry-after:', retryAfterSec, 's')
       return { rateLimited: true, retryAfterSec }
     }
 
-    // P1: clear token cache on auth failure so fresh token is read next poll
     if (res.status === 401 || res.status === 403) {
       _cachedOAuthToken = null
       _tokenCacheTime = 0
@@ -944,15 +942,10 @@ function registerProxiedHandlers() {
 
   registerHandler('claude:get-usage', async () => {
     try {
-      // Try session key first (lenient rate limits on claude.ai)
       const sessionResult = await fetchUsageViaSessionKey()
       if (sessionResult) return sessionResult
-
-      // Fall back to OAuth (strict rate limits on api.anthropic.com)
       const oauthResult = await fetchUsageViaOAuth()
-      if (oauthResult && 'rateLimited' in oauthResult) {
-        return oauthResult  // already contains retryAfterSec from actual Retry-After header
-      }
+      if (oauthResult && 'rateLimited' in oauthResult) return oauthResult
       return oauthResult
     } catch (e) {
       logger.error('[usage] get-usage failed:', e)
