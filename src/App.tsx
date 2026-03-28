@@ -252,6 +252,11 @@ export default function App() {
             setActiveProfileName(localProfile.name)
           }
         } else if (active) {
+          // For local profiles opened in a new window, load the profile snapshot
+          // so workspaces.json reflects this profile's data (not the previous profile's)
+          if (launchProfileId) {
+            await window.electronAPI.profile.load(active.id)
+          }
           setActiveProfileName(active.name)
         } else if (result.profiles.length > 0) {
           // Fallback: activeProfileId didn't match any profile — use first local profile
@@ -329,14 +334,6 @@ export default function App() {
     }
   }, [])
 
-  const handleCreateWorkspace = useCallback(async () => {
-    const folderPath = await window.electronAPI.dialog.createFolder()
-    if (folderPath) {
-      const name = folderPath.split(/[/\\]/).pop() || 'Workspace'
-      workspaceStore.addWorkspace(name, folderPath)
-      workspaceStore.save()
-    }
-  }, [])
 
   const handleDetachWorkspace = useCallback(async (workspaceId: string) => {
     await window.electronAPI.workspace.detach(workspaceId)
@@ -478,7 +475,6 @@ export default function App() {
         onSetWorkspaceGroup={(id, group) => workspaceStore.setWorkspaceGroup(id, group)}
         onSelectWorkspace={(id) => workspaceStore.setActiveWorkspace(id)}
         onAddWorkspace={handleAddWorkspace}
-        onCreateWorkspace={handleCreateWorkspace}
         onRemoveWorkspace={(id) => {
           workspaceStore.removeWorkspace(id)
           workspaceStore.save()

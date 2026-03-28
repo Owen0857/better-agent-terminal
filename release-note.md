@@ -1,6 +1,28 @@
 # Release Notes — v2.1.x
 
-## v2.1.1
+## v2.1.3
+
+### New Features
+
+#### Profile Workspace Isolation
+- New profile opened in a new window now starts with empty workspace list (previously showed old profile's workspaces)
+
+#### Drag-and-Drop Workspace
+- Drag folders from Finder/Explorer directly onto the sidebar workspace list to add them
+- Supports multiple folders at once
+- Visual feedback with dashed blue outline during drag
+
+#### Native Create Folder in Add Workspace
+- Folder picker now natively supports creating new folders (macOS "New Folder" button / Windows native support)
+- Simplified from split button back to single "Add Workspace" button
+
+### Bug Fixes
+- Fixed extra line breaks in markdown preview (`breaks: false` for GFM standard behavior)
+- Fixed `fs.readFile` error handling in MarkdownPreviewPanel (#51, @Owen0857)
+
+---
+
+## v2.1.2
 
 ### New Features
 
@@ -18,6 +40,22 @@
 - Header with filename, copy path, open file, and close buttons
 - Reuses existing markdown pipeline (marked + DOMPurify + highlight.js + mermaid)
 
+#### Workspace Context Menu
+- Added "Copy Path" option to right-click workspace menu
+
+### Community Contributions
+- **@Owen0857**: Collapse output for read-only tools (Read, Glob, Grep, LS) (#42)
+- **@Owen0857**: Usage polling rate-limit backoff fix (#44)
+- **@Owen0857**: SDK plugin loading support (#40)
+- **@handpower**: File URL parsing fix (#41)
+- **@handpower**: Markdown rendering in Agent chat panel (#39)
+
+---
+
+## v2.1.1
+
+### New Features
+
 #### Default Model & Effort Settings
 - New settings: Default Model (text input) and Default Effort Level (dropdown)
 - Applied to new Agent sessions automatically
@@ -27,13 +65,6 @@
 #### Enable 1M Context Toggle
 - New checkbox in Settings to enable/disable 1M token context window
 - Default: enabled (1M is GA for Opus 4.6 / Sonnet 4.6)
-
-#### Create New Workspace Folder
-- "Add Workspace" button now has a "+" split button to create a new folder
-- Uses save dialog to pick location and name, auto-creates the directory
-
-#### Workspace Context Menu
-- Added "Copy Path" option to right-click workspace menu
 
 ### Improvements
 
@@ -58,10 +89,3 @@
 - Fixed usage polling rate-limit backoff (use retryAfterSec directly)
 - Support `file://` URLs in LinkedText
 - Restored original 2min usage polling (SDK rate_limits lacks 7d data)
-
-### Community Contributions
-- **@Owen0857**: Collapse output for read-only tools (Read, Glob, Grep, LS) (#42)
-- **@Owen0857**: Usage polling rate-limit backoff fix (#44)
-- **@Owen0857**: SDK plugin loading support (#40)
-- **@handpower**: File URL parsing fix (#41)
-- **@handpower**: Markdown rendering in Agent chat panel (#39)

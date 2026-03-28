@@ -17,7 +17,6 @@ interface SidebarProps {
   onSetWorkspaceGroup: (id: string, group: string | undefined) => void
   onSelectWorkspace: (id: string) => void
   onAddWorkspace: () => void
-  onCreateWorkspace: () => void
   onRemoveWorkspace: (id: string) => void
   onRenameWorkspace: (id: string, alias: string) => void
   onReorderWorkspaces: (workspaceIds: string[]) => void
@@ -39,7 +38,6 @@ export function Sidebar({
   onSetWorkspaceGroup,
   onSelectWorkspace,
   onAddWorkspace,
-  onCreateWorkspace,
   onRemoveWorkspace,
   onRenameWorkspace,
   onReorderWorkspaces,
@@ -54,6 +52,7 @@ export function Sidebar({
   const [draggedId, setDraggedId] = useState<string | null>(null)
   const [dragOverId, setDragOverId] = useState<string | null>(null)
   const [dragPosition, setDragPosition] = useState<'before' | 'after' | null>(null)
+  const [externalDragOver, setExternalDragOver] = useState(false)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; workspaceId: string } | null>(null)
   const [githubUrl, setGithubUrl] = useState<string | null>(null)
   const [groupEditTarget, setGroupEditTarget] = useState<string | null>(null)
@@ -287,7 +286,38 @@ export function Sidebar({
           </select>
         </div>
       )}
-      <div className="workspace-list">
+      <div
+        className={`workspace-list${externalDragOver ? ' external-drag-over' : ''}`}
+        onDragOver={(e) => {
+          // Only react to external file drops (not internal workspace reorder)
+          if (draggedId) return
+          if (e.dataTransfer.types.includes('Files')) {
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'copy'
+            setExternalDragOver(true)
+          }
+        }}
+        onDragLeave={(e) => {
+          // Only reset if leaving the workspace-list entirely
+          if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
+            setExternalDragOver(false)
+          }
+        }}
+        onDrop={(e) => {
+          setExternalDragOver(false)
+          if (draggedId) return
+          e.preventDefault()
+          const files = Array.from(e.dataTransfer.files)
+          for (const file of files) {
+            const filePath = (file as any).path as string
+            if (filePath) {
+              const name = filePath.split(/[/\\]/).pop() || 'Workspace'
+              workspaceStore.addWorkspace(name, filePath)
+            }
+          }
+          if (files.length > 0) workspaceStore.save()
+        }}
+      >
         {filteredWorkspaces.map(workspace => (
           <div
             key={workspace.id}
@@ -366,14 +396,9 @@ export function Sidebar({
         )}
       </div>
       <div className="sidebar-footer">
-        <div className="add-workspace-group">
-          <button className="add-workspace-btn" onClick={onAddWorkspace} title={t('sidebar.openExisting')}>
-            {t('sidebar.addWorkspace')}
-          </button>
-          <button className="add-workspace-new-btn" onClick={onCreateWorkspace} title={t('sidebar.createNewFolder')}>
-            +
-          </button>
-        </div>
+        <button className="add-workspace-btn" onClick={onAddWorkspace}>
+          {t('sidebar.addWorkspace')}
+        </button>
         <div className="sidebar-footer-buttons">
           <button className="settings-btn" onClick={onOpenProfiles}>
             {t('sidebar.profiles')}

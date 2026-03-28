@@ -129,7 +129,7 @@ import DOMPurify from 'dompurify'
 // Configure marked with GFM (tables, task lists, strikethrough) + highlight.js
 marked.setOptions({
   gfm: true,
-  breaks: true,
+  breaks: false,
 })
 
 // Custom renderer for code blocks (syntax highlighting) and links (open in browser)
