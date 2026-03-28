@@ -32,9 +32,12 @@
 
 - Our status line implementation is superior to external alternatives (e.g., ccstatusline). Do not replace it.
 - 13 configurable items with custom colors, zone alignment, and template-based config.
-- Usage polling: Firefox cookie (plaintext SQLite, no decryption) → OAuth `/api/oauth/usage` fallback.
+- Usage polling: Firefox cookie (primary) → OAuth `/api/oauth/usage` (fallback).
+- Firefox `cookies.sqlite`: plaintext `value` column, query `moz_cookies` where `host LIKE '%claude.ai%' AND name = 'sessionKey'`.
+- Firefox profile resolved from `profiles.ini` (`Default=1` → `[Profile0]` fallback); supports `IsRelative` flag.
+- Session key cached 30 min; EBUSY (Firefox running) skips re-read for 10 min, returns stale cache.
+- Org ID fetched via `claude.ai/api/organizations` with session key cookie, cached 30 min.
 - Chrome 127+ uses App-Bound Encryption (v20/APPB) — DPAPI cannot decrypt. Chrome/Edge cookie approach removed.
-- Firefox `cookies.sqlite`: plaintext `value` column, query `moz_cookies` where `host LIKE '%claude.ai%'`.
 - SDK `rate_limit_event`: `utilization` is always missing (SDK omits it); only `resetsAt` is reliable.
 - OAuth rate-limit: cumulative backoff 120s→240s→480s→600s (streak counter, resets on success).
 - 5h pacing indicator compares utilization vs time-elapsed %; pure frontend calc, no extra API calls.
