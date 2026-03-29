@@ -1212,6 +1212,23 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       }
       return
     }
+    if (e.key === 'PageUp' || e.key === 'PageDown' || e.key === 'Home' || e.key === 'End') {
+      const container = messagesContainerRef.current
+      if (e.key === 'PageUp') {
+        e.preventDefault()
+        if (container) container.scrollTop -= container.clientHeight * 0.85
+      } else if (e.key === 'PageDown') {
+        e.preventDefault()
+        if (container) container.scrollTop += container.clientHeight * 0.85
+      } else if (e.key === 'Home') {
+        if (container) container.scrollTop = 0
+        // no preventDefault — textarea cursor moves to line start
+      } else {
+        if (container) container.scrollTop = container.scrollHeight
+        // no preventDefault — textarea cursor moves to line end
+      }
+      return
+    }
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       handleSend()
