@@ -284,6 +284,7 @@
   white-space: pre-wrap;
   background: var(--bg-secondary);
   border-radius: var(--radius-sm);
+  border-left: 3px solid var(--accent-color);
   display: inline-block;
   max-width: 100%;
 }
