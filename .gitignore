@@ -14,3 +14,9 @@ nul
 
 # Diagnosis reports
 tests/*.json
+
+# Claude Code ctags index
+.claude/tags
+
+# Git worktrees
+.worktrees/

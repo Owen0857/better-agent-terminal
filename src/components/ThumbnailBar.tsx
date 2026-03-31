@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect, useCallback, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
-import type { TerminalInstance } from '../types'
+import type { TerminalInstance, QuickAction } from '../types'
 import { TerminalThumbnail } from './TerminalThumbnail'
 import type { AgentPreset } from '../types/agent-presets'
+import { getAgentPreset } from '../types/agent-presets'
+import { QuickActionContextMenu } from './QuickActionContextMenu'
 
 interface ThumbnailBarProps {
   terminals: TerminalInstance[]
@@ -21,6 +23,13 @@ interface ThumbnailBarProps {
   height?: number
   collapsed?: boolean
   onCollapse?: () => void
+  // Quick Actions
+  quickActions?: QuickAction[]
+  onExecuteAction?: (action: QuickAction) => void
+  onReorderActions?: (orderedIds: string[]) => void
+  onCreateAction?: () => void
+  onEditAction?: (action: QuickAction) => void
+  onDeleteAction?: (actionId: string) => void
 }
 
 export function ThumbnailBar({
@@ -38,7 +47,13 @@ export function ThumbnailBar({
   showAddButton,
   height,
   collapsed = false,
-  onCollapse
+  onCollapse,
+  quickActions,
+  onExecuteAction,
+  onReorderActions,
+  onCreateAction,
+  onEditAction,
+  onDeleteAction
 }: ThumbnailBarProps) {
   const { t } = useTranslation()
   const label = t('terminal.workspaceSessions')
@@ -49,30 +64,22 @@ export function ThumbnailBar({
   const [dropPosition, setDropPosition] = useState<'before' | 'after'>('before')
   const [showAddMenu, setShowAddMenu] = useState(false)
   const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({})
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; terminalId: string } | null>(null)
-  const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number } | null>(null)
+  const [thumbMenu, setThumbMenu] = useState<{ x: number; y: number; terminalId: string } | null>(null)
+  const [thumbMenuPos, setThumbMenuPos] = useState<{ x: number; y: number } | null>(null)
   const addMenuRef = useRef<HTMLDivElement>(null)
   const addMenuPopupRef = useRef<HTMLDivElement>(null)
   const addBtnRef = useRef<HTMLButtonElement>(null)
   const thumbnailListRef = useRef<HTMLDivElement>(null)
   const middlePanRef = useRef<{ startX: number; startScrollLeft: number } | null>(null)
-  const contextMenuRef = useRef<HTMLDivElement>(null)
+  const thumbMenuRef = useRef<HTMLDivElement>(null)
 
-  // Close menu on outside click
-  useEffect(() => {
-    if (!showAddMenu) return
-    const handleClick = (e: MouseEvent) => {
-      const target = e.target as Node
-      if (
-        addMenuRef.current && !addMenuRef.current.contains(target) &&
-        addMenuPopupRef.current && !addMenuPopupRef.current.contains(target)
-      ) {
-        setShowAddMenu(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [showAddMenu])
+  // Quick Action state
+  const [draggedActionId, setDraggedActionId] = useState<string | null>(null)
+  const [dropTargetActionId, setDropTargetActionId] = useState<string | null>(null)
+  const [dropActionPosition, setDropActionPosition] = useState<'before' | 'after'>('before')
+  const [contextMenu, setContextMenu] = useState<{ action: QuickAction; x: number; y: number } | null>(null)
+  const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number } | null>(null)
+  const contextMenuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!contextMenu) return
@@ -205,7 +212,89 @@ export function ThumbnailBar({
   const handleThumbnailContextMenu = useCallback((e: React.MouseEvent, terminalId: string) => {
     e.preventDefault()
     e.stopPropagation()
-    setContextMenu({ x: e.clientX, y: e.clientY, terminalId })
+    setThumbMenu({ x: e.clientX, y: e.clientY, terminalId })
+  }, [])
+
+  // Quick Action horizontal drag handlers
+  const handleActionDragStart = useCallback((e: React.DragEvent, actionId: string) => {
+    setDraggedActionId(actionId)
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', actionId)
+    if (e.currentTarget instanceof HTMLElement) {
+      e.currentTarget.style.opacity = '0.4'
+    }
+  }, [])
+
+  const handleActionDragEnd = useCallback((e: React.DragEvent) => {
+    if (e.currentTarget instanceof HTMLElement) {
+      e.currentTarget.style.opacity = '1'
+    }
+    setDraggedActionId(null)
+    setDropTargetActionId(null)
+  }, [])
+
+  const handleActionDragOver = useCallback((e: React.DragEvent, actionId: string) => {
+    if (!draggedActionId || actionId === draggedActionId) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    const midX = rect.left + rect.width / 2
+    const pos = e.clientX < midX ? 'before' : 'after'
+
+    setDropTargetActionId(actionId)
+    setDropActionPosition(pos)
+  }, [draggedActionId])
+
+  const handleActionDragLeave = useCallback((e: React.DragEvent) => {
+    const related = e.relatedTarget as HTMLElement | null
+    if (!related || !(e.currentTarget as HTMLElement).contains(related)) {
+      setDropTargetActionId(null)
+    }
+  }, [])
+
+  const handleActionDrop = useCallback((e: React.DragEvent, targetId: string) => {
+    e.preventDefault()
+    if (!draggedActionId || draggedActionId === targetId || !onReorderActions || !quickActions) return
+
+    const currentOrder = quickActions.map(a => a.id)
+    const draggedIndex = currentOrder.indexOf(draggedActionId)
+    if (draggedIndex === -1) return
+
+    currentOrder.splice(draggedIndex, 1)
+
+    let newIndex = currentOrder.indexOf(targetId)
+    if (dropActionPosition === 'after') {
+      newIndex += 1
+    }
+
+    currentOrder.splice(newIndex, 0, draggedActionId)
+    onReorderActions(currentOrder)
+
+    setDraggedActionId(null)
+    setDropTargetActionId(null)
+  }, [draggedActionId, dropActionPosition, quickActions, onReorderActions])
+
+  const handleActionContextMenu = useCallback((e: React.MouseEvent, action: QuickAction) => {
+    e.preventDefault()
+
+    const menuWidth = 150
+    const menuHeight = 80
+
+    let x = e.clientX
+    let y = e.clientY + 2
+
+    if (x + menuWidth > window.innerWidth) {
+      x = e.clientX - menuWidth
+    }
+    if (x < 0) {
+      x = 8
+    }
+    if (y + menuHeight > window.innerHeight) {
+      y = e.clientY - menuHeight
+    }
+
+    setContextMenu({ action, x, y })
   }, [])
 
   // Collapsed state - show icon bar
@@ -229,29 +318,31 @@ export function ThumbnailBar({
       <div className="thumbnail-bar-header">
         <span>{label}</span>
         <div className="thumbnail-bar-actions">
-          {onAddTerminal && (
-            <div className="thumbnail-add-wrapper" ref={addMenuRef}>
+          {/* Quick Action Buttons */}
+          {quickActions && quickActions.map(action => (
+            <div
+              key={action.id}
+              draggable={!!onReorderActions}
+              onDragStart={(e) => handleActionDragStart(e, action.id)}
+              onDragEnd={handleActionDragEnd}
+              onDragOver={(e) => handleActionDragOver(e, action.id)}
+              onDragLeave={handleActionDragLeave}
+              onDrop={(e) => handleActionDrop(e, action.id)}
+              className={`quick-action-drag-wrapper${
+                dropTargetActionId === action.id && draggedActionId !== action.id
+                  ? ` drop-${dropActionPosition}`
+                  : ''
+              }${draggedActionId === action.id ? ' dragging' : ''}`}
+            >
               <button
-                ref={addBtnRef}
-                className="thumbnail-add-btn"
-                onClick={() => {
-                  setShowAddMenu(prev => {
-                    if (!prev && addBtnRef.current) {
-                      const rect = addBtnRef.current.getBoundingClientRect()
-                      const menuHeight = 200
-                      const spaceBelow = window.innerHeight - rect.bottom
-                      const openUpward = spaceBelow < menuHeight && rect.top > menuHeight
-                      setMenuStyle(openUpward
-                        ? { bottom: window.innerHeight - rect.top + 4, right: window.innerWidth - rect.right }
-                        : { top: rect.bottom + 4, right: window.innerWidth - rect.right }
-                      )
-                    }
-                    return !prev
-                  })
-                }}
-                title={t('terminal.addTerminalOrAgent')}
+                className="quick-action-btn"
+                onClick={() => onExecuteAction?.(action)}
+                onContextMenu={(e) => handleActionContextMenu(e, action)}
+                title={`${action.label}${action.hotkey ? ` (${action.hotkey})` : ''}`}
+                style={{ '--action-color': action.color } as React.CSSProperties}
               >
-                +
+                <span className="quick-action-icon">{action.icon}</span>
+                <span className="quick-action-label">{action.label}</span>
               </button>
               {showAddMenu && createPortal(
                 <div className="thumbnail-add-menu" ref={addMenuPopupRef} style={menuStyle}>
@@ -314,7 +405,20 @@ export function ThumbnailBar({
                 document.body
               )}
             </div>
+          ))}
+
+          {/* Add Quick Action button */}
+          {onCreateAction && (
+            <button
+              className="quick-action-add-btn"
+              onClick={onCreateAction}
+              title="Add Quick Action"
+            >
+              +
+            </button>
           )}
+
+          {/* Collapse button */}
           {onCollapse && (
             <button className="thumbnail-collapse-btn" onClick={onCollapse} title={t('terminal.collapsePanel')}>
               ▼
@@ -371,26 +475,43 @@ export function ThumbnailBar({
           </div>
         ))}
       </div>
-      {contextMenu && onCloseTerminal && createPortal(
+      {thumbMenu && onCloseTerminal && createPortal(
         <div
-          ref={contextMenuRef}
+          ref={thumbMenuRef}
           className="workspace-context-menu"
-          style={contextMenuPos
-            ? { left: contextMenuPos.x, top: contextMenuPos.y }
-            : { left: contextMenu.x, top: contextMenu.y, visibility: 'hidden' as const }
+          style={thumbMenuPos
+            ? { left: thumbMenuPos.x, top: thumbMenuPos.y }
+            : { left: thumbMenu.x, top: thumbMenu.y, visibility: 'hidden' as const }
           }
         >
           <div
             className="context-menu-item danger"
             onClick={() => {
-              onCloseTerminal(contextMenu.terminalId)
-              setContextMenu(null)
+              onCloseTerminal(thumbMenu.terminalId)
+              setThumbMenu(null)
             }}
           >
             {t('terminal.closeTerminal')}
           </div>
         </div>,
         document.body
+      )}
+
+      {/* Quick Action Context Menu */}
+      {contextMenu && (
+        <QuickActionContextMenu
+          action={contextMenu.action}
+          position={{ x: contextMenu.x, y: contextMenu.y }}
+          onEdit={() => {
+            onEditAction?.(contextMenu.action)
+            setContextMenu(null)
+          }}
+          onDelete={() => {
+            onDeleteAction?.(contextMenu.action.id)
+            setContextMenu(null)
+          }}
+          onClose={() => setContextMenu(null)}
+        />
       )}
     </div>
   )

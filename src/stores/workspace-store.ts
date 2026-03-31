@@ -188,7 +188,7 @@ class WorkspaceStore {
     this.save()
   }
 
-  setTerminalSessionMeta(terminalId: string, meta: { totalCost: number; inputTokens: number; outputTokens: number; durationMs: number; numTurns: number; contextWindow: number; cacheReadTokens?: number; cacheCreationTokens?: number }): void {
+  setTerminalSessionMeta(terminalId: string, meta: { totalCost: number; inputTokens: number; outputTokens: number; durationMs: number; numTurns: number; contextWindow: number; contextTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number }): void {
     this.state = {
       ...this.state,
       terminals: this.state.terminals.map(t =>

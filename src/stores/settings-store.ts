@@ -1,4 +1,4 @@
-import type { AppSettings, ShellType, FontType, ColorPresetId, EnvVariable, AgentCommandType, StatuslineItemConfig, StatuslineItemId, LanguageCode, EffortLevel, CodexEffortLevel } from '../types'
+import type { AppSettings, ShellType, FontType, ColorPresetId, EnvVariable, AgentCommandType, StatuslineItemConfig, StatuslineItemId, LanguageCode, EffortLevel, CodexEffortLevel, QuickAction } from '../types'
 import type { AgentPresetId } from '../types/agent-presets'
 import { CODEX_EFFORT_LEVELS, FONT_OPTIONS, COLOR_PRESETS, AGENT_COMMAND_OPTIONS, STATUSLINE_ITEMS } from '../types'
 import { CLAUDE_BUILTIN_MODELS, CLAUDE_OPUS_47_1M_PRESET, normalizeClaudeModelSelection } from '../utils/claude-model-presets'
@@ -205,6 +205,19 @@ class SettingsStore {
     this.notify()
     this.save()
   }
+
+  setCodexCliDangerousMode(enabled: boolean): void {
+    this.settings = { ...this.settings, codexCliDangerousMode: enabled }
+    this.notify()
+    this.save()
+  }
+
+  setQuickActions(quickActions: QuickAction[]): void {
+    this.settings = { ...this.settings, quickActions }
+    this.notify()
+    this.save()
+  }
+
 
   setCollapseToolOutputs(collapse: boolean): void {
     this.settings = { ...this.settings, collapseToolOutputs: collapse }

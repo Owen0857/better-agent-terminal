@@ -1,5 +1,8 @@
 import { AgentPresetId } from './agent-presets';
 
+export type { QuickAction } from './quick-action'
+export { DEFAULT_QUICK_ACTIONS } from './quick-action'
+
 // 環境變數定義
 export interface EnvVariable {
   key: string;
@@ -258,6 +261,7 @@ export interface AppSettings {
   cxSemanticNavigationEnabled?: boolean;  // Enable optional cx semantic code navigation prompt integration
   cxBinaryPath?: string;                  // Optional explicit cx binary path
   worktreePnpmInstallEnabled?: boolean;   // Auto-install pnpm dependencies for new worktrees using a shared pnpm store
+  quickActions?: QuickAction[];  // Quick Action Buttons 配置
 }
 
 // ============================================

@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useState, lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { Workspace, TerminalInstance, EnvVariable } from '../types'
+import type { Workspace, TerminalInstance, EnvVariable, QuickAction } from '../types'
 import { workspaceStore } from '../stores/workspace-store'
 import { settingsStore } from '../stores/settings-store'
 import { ThumbnailBar } from './ThumbnailBar'
@@ -10,6 +10,8 @@ import { FolderPicker } from './FolderPicker'
 import { NewTerminalQuickPick, type QuickPickChoice } from './NewTerminalQuickPick'
 import { AgentPresetId, getAgentPreset, getVisiblePresets } from '../types/agent-presets'
 import { isProcfileName } from '../utils/procfile-parser'
+import { QuickActionDialog } from './QuickActionDialog'
+import * as quickActionManager from '../utils/quick-action-manager'
 
 // Lazy load heavy components (xterm.js, Claude SDK, etc.)
 const MainPanel = lazy(() => import('./MainPanel').then(m => ({ default: m.MainPanel })))
@@ -161,6 +163,22 @@ export function WorkspaceView({ workspace, terminals, focusedTerminalId, isActiv
       try { localStorage.setItem(TAB_KEY, 'terminal') } catch { /* ignore */ }
     }
   }, [hasGithubRemote, activeTab])
+
+  // Quick Action state
+  const [quickActionDialog, setQuickActionDialog] = useState<{
+    mode: 'create' | 'edit'
+    action?: QuickAction
+  } | null>(null)
+  const [quickActions, setQuickActions] = useState<QuickAction[]>(quickActionManager.getAll())
+  const settings = settingsStore.getSettings()
+
+  // Subscribe to settings changes to update quick actions
+  useEffect(() => {
+    const unsubscribe = settingsStore.subscribe(() => {
+      setQuickActions(quickActionManager.getAll())
+    })
+    return unsubscribe
+  }, [])
 
   const handleTabChange = useCallback((tab: WorkspaceTab) => {
     setActiveTab(tab)
@@ -559,6 +577,103 @@ export function WorkspaceView({ workspace, terminals, focusedTerminalId, isActiv
     }
   }, [handleAddTerminal, handleAddWorktreeTerminal, handleAddAgent])
 
+  const handleExecuteAction = useCallback(async (action: QuickAction) => {
+    const shell = await getShellFromSettings()
+    const customEnv = mergeEnvVars(settings.globalEnvVars, workspace.envVars)
+
+    if (action.type === 'claude-code') {
+      const agentTerminal = workspaceStore.addTerminal(workspace.id, 'claude-code')
+      if (action.modelOverride) {
+        workspaceStore.updateTerminalModel(agentTerminal.id, action.modelOverride)
+      }
+      workspaceStore.setFocusedTerminal(agentTerminal.id)
+      workspaceStore.save()
+    } else if (action.type !== 'none') {
+      const agentTerminal = workspaceStore.addTerminal(workspace.id, action.type)
+      window.electronAPI.pty.create({
+        id: agentTerminal.id,
+        cwd: workspace.folderPath,
+        type: 'terminal',
+        agentPreset: action.type,
+        shell,
+        customEnv
+      })
+      const preset = getAgentPreset(action.type)
+      const commandToRun = action.command || preset?.command
+      if (commandToRun) {
+        setTimeout(() => {
+          window.electronAPI.pty.write(agentTerminal.id, commandToRun + '\r')
+        }, 500)
+      }
+      workspaceStore.setFocusedTerminal(agentTerminal.id)
+      workspaceStore.save()
+    } else {
+      const terminal = workspaceStore.addTerminal(workspace.id)
+      window.electronAPI.pty.create({
+        id: terminal.id,
+        cwd: workspace.folderPath,
+        type: 'terminal',
+        shell,
+        customEnv
+      })
+      if (action.command) {
+        setTimeout(() => {
+          window.electronAPI.pty.write(terminal.id, action.command! + '\r')
+        }, 500)
+      }
+      workspaceStore.setFocusedTerminal(terminal.id)
+      workspaceStore.save()
+    }
+  }, [workspace.id, workspace.folderPath, workspace.envVars, settings.globalEnvVars])
+
+  const handleCreateAction = useCallback(() => {
+    setQuickActionDialog({ mode: 'create' })
+  }, [])
+
+  const handleEditAction = useCallback((action: QuickAction) => {
+    setQuickActionDialog({ mode: 'edit', action })
+  }, [])
+
+  const handleDeleteAction = useCallback((actionId: string) => {
+    const success = quickActionManager.remove(actionId)
+    if (!success) {
+      console.warn('Failed to delete action:', actionId)
+    }
+  }, [])
+
+  const handleReorderActions = useCallback((orderedIds: string[]) => {
+    quickActionManager.reorder(orderedIds)
+  }, [])
+
+  const handleSaveAction = useCallback((actionData: Omit<QuickAction, 'order'>) => {
+    if (quickActionDialog?.mode === 'create') {
+      quickActionManager.add(actionData)
+    } else if (quickActionDialog?.mode === 'edit' && quickActionDialog.action) {
+      quickActionManager.update(quickActionDialog.action.id, actionData)
+    }
+    setQuickActionDialog(null)
+  }, [quickActionDialog])
+
+  useEffect(() => {
+    if (!isActive) return
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement
+      if (target.closest('.xterm')) return
+
+      for (const action of quickActions) {
+        if (action.hotkey && quickActionManager.matchHotkey(e, action.hotkey)) {
+          e.preventDefault()
+          handleExecuteAction(action)
+          break
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [isActive, quickActions, handleExecuteAction])
+
   const isDebugMode = window.electronAPI?.debug?.isDebugMode
 
   const handleCloseTerminal = useCallback((id: string) => {
@@ -805,6 +920,12 @@ export function WorkspaceView({ workspace, terminals, focusedTerminalId, isActiv
         height={thumbnailSettings.height}
         collapsed={thumbnailSettings.collapsed}
         onCollapse={handleThumbnailCollapse}
+        quickActions={quickActions}
+        onExecuteAction={handleExecuteAction}
+        onReorderActions={handleReorderActions}
+        onCreateAction={handleCreateAction}
+        onEditAction={handleEditAction}
+        onDeleteAction={handleDeleteAction}
       />
 
       {showCloseConfirm && (
@@ -833,6 +954,16 @@ export function WorkspaceView({ workspace, terminals, focusedTerminalId, isActiv
           supportedPresetIds={supportedPresetIds}
           onSelect={handleQuickPickSelect}
           onClose={() => setShowQuickPick(false)}
+        />
+      )}
+
+      {/* Quick Action Dialog */}
+      {quickActionDialog && (
+        <QuickActionDialog
+          mode={quickActionDialog.mode}
+          action={quickActionDialog.action}
+          onSave={handleSaveAction}
+          onCancel={() => setQuickActionDialog(null)}
         />
       )}
     </div>
