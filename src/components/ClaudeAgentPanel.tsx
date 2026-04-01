@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment, cloneElement, isValidElement } from 'react'
-import { flushSync } from 'react-dom'
+import { flushSync, createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import type { ClaudeMessage, ClaudeToolCall } from '../types/claude-agent'
 import { isToolCall } from '../types/claude-agent'
@@ -309,6 +309,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
   const middleMessageScrollRef = useRef<{ startX: number; startY: number; startScrollTop: number; startScrollLeft: number } | null>(null)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null)
   const [aboveViewportUserMsgIds, setAboveViewportUserMsgIds] = useState<Set<string>>(new Set())
+  const [selectionPopup, setSelectionPopup] = useState<{ x: number; y: number; text: string } | null>(null)
   const [claudeFontSize, setClaudeFontSize] = useState(settingsStore.getSettings().fontSize)
   const userMsgRefsMap = useRef<Map<string, HTMLDivElement>>(new Map())
   const observerRef = useRef<IntersectionObserver | null>(null)
@@ -397,9 +398,20 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     if (e.button === 0) markUserScrollIntent()
   }, [markUserScrollIntent])
 
-  const handleMessagesMouseUp = useCallback(() => {
+  const handleMessagesMouseUp = useCallback((e: React.MouseEvent) => {
     clearMiddleMessageScroll()
     userScrollIntentUntilRef.current = performance.now() + 300
+    const selection = window.getSelection()
+    if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+      setSelectionPopup(null)
+      return
+    }
+    const text = selection.toString()
+    setSelectionPopup({
+      x: e.clientX,
+      y: e.clientY - 8,
+      text,
+    })
   }, [clearMiddleMessageScroll])
 
   const handleMessagesAuxClick = useCallback((e: React.MouseEvent) => {
@@ -1432,6 +1444,39 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + 'px'
     }
   }, [])
+
+  const handleSelectionReply = useCallback(() => {
+    if (!selectionPopup) return
+    const current = inputValueRef.current
+    const sep = current && !current.endsWith(' ') ? ' ' : ''
+    const appended = current + sep + selectionPopup.text + ' '
+    setInputValue(appended)
+    setSelectionPopup(null)
+    window.getSelection()?.removeAllRanges()
+    textareaRef.current?.focus()
+  }, [selectionPopup, setInputValue])
+
+  // Dismiss selection popup on outside mousedown or Enter/Escape
+  useEffect(() => {
+    if (!selectionPopup) return
+    const onMouseDown = () => setSelectionPopup(null)
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (document.activeElement === textareaRef.current) return
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        handleSelectionReply()
+      } else if (e.key === 'Escape') {
+        setSelectionPopup(null)
+        window.getSelection()?.removeAllRanges()
+      }
+    }
+    document.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [selectionPopup, handleSelectionReply])
 
   // Listen for skill insertion from SkillsPanel
   useEffect(() => {
@@ -3260,6 +3305,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
           e.preventDefault()
           setContextMenu({ x: e.clientX, y: e.clientY })
         }}
+        onMouseUp={handleMessagesMouseUp}
       >
         {(hasMoreArchived || isLoadingMore) && (
           <div className="claude-load-more">
@@ -3327,6 +3373,27 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
           </button>
         )}
       </div>
+
+      {/* Selection Reply Popup — rendered via portal to avoid parent transform issues */}
+      {selectionPopup && createPortal(
+        <div
+          className="selection-reply-popup"
+          style={{ left: `${selectionPopup.x}px`, top: `${selectionPopup.y}px` }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            className="selection-reply-btn"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              handleSelectionReply()
+            }}
+          >
+            Reply
+          </button>
+        </div>,
+        document.body
+      )}
 
       {/* Permission Request Card — vertical list */}
       {pendingPermission && (() => {

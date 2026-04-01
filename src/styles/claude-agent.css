@@ -493,6 +493,25 @@
   background: var(--bg-hover);
 }
 
+.selection-reply-popup {
+  position: fixed;
+  transform: translate(-50%, -100%);
+  z-index: 1000;
+  pointer-events: auto;
+}
+.selection-reply-btn {
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: var(--claude-accent);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+.selection-reply-btn:hover {
+  opacity: 0.85;
+}
+
 /* Thinking indicator */
 .claude-thinking {
   display: flex;
