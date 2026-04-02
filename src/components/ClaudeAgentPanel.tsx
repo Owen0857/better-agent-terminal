@@ -1040,6 +1040,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
         setPermissionMode(mode)
       }),
 
+      api.onEffortChange((sid: string, effort: string) => {
+        if (sid !== sessionId) return
+        setEffortLevel(effort)
+      }),
+
       api.onPromptSuggestion((sid: string, suggestion: string) => {
         if (sid !== sessionId) return
         setPromptSuggestion(suggestion)
@@ -3837,6 +3842,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
               <select
                 className="claude-effort-select"
                 value={effortLevel}
+                data-effort={effortLevel}
                 onChange={handleEffortChange}
                 title={t('claude.effortLevel')}
               >

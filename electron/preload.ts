@@ -166,6 +166,11 @@ const electronAPI = {
       ipcRenderer.on('claude:modeChange', handler)
       return () => ipcRenderer.removeListener('claude:modeChange', handler)
     },
+    onEffortChange: (callback: (sessionId: string, effort: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, sessionId: string, effort: string) => callback(sessionId, effort)
+      ipcRenderer.on('claude:effortChange', handler)
+      return () => ipcRenderer.removeListener('claude:effortChange', handler)
+    },
     setPermissionMode: (sessionId: string, mode: string) =>
       ipcRenderer.invoke('claude:set-permission-mode', sessionId, mode),
     setCodexSandboxMode: (sessionId: string, mode: 'read-only' | 'workspace-write' | 'danger-full-access') =>

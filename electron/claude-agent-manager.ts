@@ -2018,6 +2018,7 @@ export class ClaudeAgentManager {
     const session = this.sessions.get(sessionId)
     if (!session) return false
     session.effort = effort
+    this.send('claude:effortChange', sessionId, effort)
     return true
   }
 
