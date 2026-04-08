@@ -263,7 +263,13 @@ export class PtyManager {
           // Force color output
           FORCE_COLOR: '3',
           // Ensure not detected as CI environment
-          CI: ''
+          CI: '',
+          // Disable Claude Code CLI's TUI flicker / alternate-screen behavior so that
+          // manually running `claude` in any terminal doesn't cause screen flash or
+          // history duplication in xterm.js.  claude-cli preset sets this too; setting
+          // it here covers regular terminals where the user runs `claude` by hand.
+          // customEnv can override this by passing CLAUDE_CODE_NO_FLICKER explicitly.
+          ...(!('CLAUDE_CODE_NO_FLICKER' in customEnv) && { CLAUDE_CODE_NO_FLICKER: '1' })
         })
 
         const ptyProcess = pty.spawn(shell, args, {
@@ -330,7 +336,8 @@ export class PtyManager {
           TERM_PROGRAM: 'better-terminal',
           TERM_PROGRAM_VERSION: '1.0',
           FORCE_COLOR: '3',
-          CI: ''
+          CI: '',
+          ...(!('CLAUDE_CODE_NO_FLICKER' in customEnv) && { CLAUDE_CODE_NO_FLICKER: '1' })
         })
 
         const childProcess = spawn(shell, shellArgs, {
