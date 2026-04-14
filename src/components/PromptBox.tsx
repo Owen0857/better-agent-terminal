@@ -78,10 +78,13 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
     const history = getHistory()
     if (history.length === 0) return
 
-    // Up arrow: only when cursor is at the start (first line)
+    // Up arrow: only when cursor is on the first line
     if (e.key === 'ArrowUp') {
       const textarea = textareaRef.current
-      if (textarea && textarea.selectionStart !== 0) return
+      if (textarea) {
+        const isOnFirstLine = !text.substring(0, textarea.selectionStart).includes('\n')
+        if (!isOnFirstLine) return
+      }
 
       e.preventDefault()
       if (historyIndex === -1) {
@@ -94,10 +97,13 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
       return
     }
 
-    // Down arrow: only when cursor is at the end (last line)
+    // Down arrow: only when cursor is on the last line
     if (e.key === 'ArrowDown') {
       const textarea = textareaRef.current
-      if (textarea && textarea.selectionStart !== textarea.value.length) return
+      if (textarea) {
+        const isOnLastLine = !text.substring(textarea.selectionStart).includes('\n')
+        if (!isOnLastLine) return
+      }
       if (historyIndex === -1) return
 
       e.preventDefault()
