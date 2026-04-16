@@ -82,7 +82,11 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
     if (e.key === 'ArrowUp') {
       const textarea = textareaRef.current
       if (textarea) {
-        const isOnFirstLine = !text.substring(0, textarea.selectionStart).includes('\n')
+        // Use textarea.value (DOM) not text (React state) to avoid stale-closure race:
+        // after user presses Enter, textarea.value is updated immediately but text state
+        // isn't flushed until next render, causing selectionStart to be past the \n
+        // while text still appears to have no \n.
+        const isOnFirstLine = !textarea.value.substring(0, textarea.selectionStart).includes('\n')
         if (!isOnFirstLine) return
       }
 
@@ -101,7 +105,7 @@ export function PromptBox({ terminalId }: Readonly<PromptBoxProps>) {
     if (e.key === 'ArrowDown') {
       const textarea = textareaRef.current
       if (textarea) {
-        const isOnLastLine = !text.substring(textarea.selectionStart).includes('\n')
+        const isOnLastLine = !textarea.value.substring(textarea.selectionStart).includes('\n')
         if (!isOnLastLine) return
       }
       if (historyIndex === -1) return
