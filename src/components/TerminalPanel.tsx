@@ -345,13 +345,21 @@ export const TerminalPanel = memo(function TerminalPanel({ terminalId, onClose, 
     }
 
     // Use MutationObserver to keep fixing position when xterm.js changes it
+    // Throttle to avoid running on every cursor move / keystroke
     let mutationCount = 0
+    let imePendingRaf = false
     const observer = new MutationObserver(() => {
       mutationCount++
       if (mutationCount <= 20 || mutationCount % 100 === 0) {
         dlog(`[render] MutationObserver #${mutationCount} terminal=${terminalId}`)
       }
-      fixImePosition()
+      if (!imePendingRaf) {
+        imePendingRaf = true
+        requestAnimationFrame(() => {
+          imePendingRaf = false
+          fixImePosition()
+        })
+      }
     })
 
     const textarea = containerRef.current?.querySelector('.xterm-helper-textarea')
@@ -436,6 +444,7 @@ export const TerminalPanel = memo(function TerminalPanel({ terminalId, onClose, 
       return true
     })
 
+
     // Right-click context menu for copy/paste
     const containerEl = containerRef.current
     const onContextMenu = (e: MouseEvent) => {
@@ -450,11 +459,17 @@ export const TerminalPanel = memo(function TerminalPanel({ terminalId, onClose, 
     containerEl.addEventListener('contextmenu', onContextMenu)
 
     // Handle terminal output
+    let activityThrottleTimer: ReturnType<typeof setTimeout> | null = null
     const unsubscribeOutput = window.electronAPI.pty.onOutput((id, data) => {
       if (id === terminalId) {
         terminal.write(data)
-        // Update activity time when there's output
-        workspaceStore.updateTerminalActivity(terminalId)
+        // Throttle activity updates to at most once per 500ms
+        if (!activityThrottleTimer) {
+          activityThrottleTimer = setTimeout(() => {
+            activityThrottleTimer = null
+            workspaceStore.updateTerminalActivity(terminalId)
+          }, 500)
+        }
       }
     })
 
@@ -524,6 +539,7 @@ export const TerminalPanel = memo(function TerminalPanel({ terminalId, onClose, 
       unsubscribeExit()
       unsubscribeSettings()
       if (resizeTimer) clearTimeout(resizeTimer)
+      if (activityThrottleTimer) clearTimeout(activityThrottleTimer)
       resizeObserver.disconnect()
       observer.disconnect()
       if (xtermTextarea) {

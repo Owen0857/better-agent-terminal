@@ -3199,9 +3199,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
                   className="claude-thinking-toggle"
                   onClick={() => {
                     if (isExpanded && autoExpandThinking) {
-                      // If auto-expanded, clicking collapses by marking it explicitly collapsed
-                      setExpandedTools(prev => { const next = new Set(prev); next.add(`${msg.id}-collapsed`); return next })
+                      // Collapse: mark explicitly collapsed and remove any explicit expand flag
+                      setExpandedTools(prev => { const next = new Set(prev); next.add(`${msg.id}-collapsed`); next.delete(msg.id); return next })
                     } else {
+                      // Expand: remove collapsed marker, then toggle
+                      setExpandedTools(prev => { const next = new Set(prev); next.delete(`${msg.id}-collapsed`); return next })
                       toggleTool(msg.id, true)
                     }
                   }}
