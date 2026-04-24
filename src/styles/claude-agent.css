@@ -1569,6 +1569,14 @@
   color: #e06c75;
   border-color: rgba(224, 108, 117, 0.4);
 }
+.claude-effort-select[data-effort="xhigh"] {
+  color: #ff6b6b;
+  border-color: rgba(255, 107, 107, 0.4);
+}
+.claude-effort-select[data-effort="max"] {
+  color: #c678dd;
+  border-color: rgba(198, 120, 221, 0.4);
+}
 
 .claude-1m-toggle {
   font-size: calc(var(--claude-font-size) - 3px);
