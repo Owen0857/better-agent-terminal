@@ -133,6 +133,17 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
   const lastEscRef = useRef(0)
   const [streamingText, setStreamingText] = useState('')
   const [streamingThinking, setStreamingThinking] = useState('')
+  const streamingTextBufRef = useRef('')
+  const streamingTextRafRef = useRef<number | null>(null)
+  const activityThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const clearStreamingText = useCallback(() => {
+    streamingTextBufRef.current = ''
+    if (streamingTextRafRef.current !== null) {
+      cancelAnimationFrame(streamingTextRafRef.current)
+      streamingTextRafRef.current = null
+    }
+    setStreamingText('')
+  }, [])
   const [showThinking, setShowThinking] = useState(false)
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set())
   const [autoExpandThinking, setAutoExpandThinking] = useState(false)
@@ -495,6 +506,30 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
   const allMessages = useMemo(() => [...loadedArchive, ...messages], [loadedArchive, messages])
   messageCountRef.current = allMessages.length
 
+  // Precompute Edit/Write line splits so renderMessage doesn't redo split('\n') on every streaming re-render
+  const editDiffLines = useMemo(() => {
+    const map = new Map<string, { oldLines: string[]; newLines: string[] }>()
+    for (const m of allMessages) {
+      if ('toolName' in m && m.toolName === 'Edit' && m.input?.old_string !== undefined) {
+        map.set(m.id, {
+          oldLines: String(m.input.old_string || '').split('\n'),
+          newLines: String(m.input.new_string || '').split('\n'),
+        })
+      }
+    }
+    return map
+  }, [allMessages])
+
+  const writeContentLines = useMemo(() => {
+    const map = new Map<string, string[]>()
+    for (const m of allMessages) {
+      if ('toolName' in m && m.toolName === 'Write' && m.input?.content !== undefined) {
+        map.set(m.id, String(m.input.content || '').split('\n'))
+      }
+    }
+    return map
+  }, [allMessages])
+
   // Active tasks (running Task/Agent tool calls) for the indicator bar
   const activeTasks = useMemo(() => {
     const tasks = allMessages.filter(m => isToolCall(m) && (m.toolName === 'Task' || m.toolName === 'Agent') && m.status === 'running') as ClaudeToolCall[]
@@ -664,7 +699,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
             setHasMoreArchived(false)
             window.electronAPI.claude.clearArchive(sessionId).catch(() => {})
           }
-          setStreamingText('')
+          clearStreamingText()
           setStreamingThinking('')
           setIsStreaming(false)
           // Restore persisted metadata instead of resetting to null (preserves status line on resume)
@@ -731,12 +766,17 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
           })
           return ''
         })
-        setStreamingText('')
+        clearStreamingText()
       }),
 
       api.onToolUse((sid: string, tool: unknown) => {
         if (sid !== sessionId) return
-        workspaceStore.updateTerminalActivity(sessionId)
+        if (!activityThrottleRef.current) {
+          activityThrottleRef.current = setTimeout(() => {
+            activityThrottleRef.current = null
+            workspaceStore.updateTerminalActivity(sessionId)
+          }, 500)
+        }
         const toolCall = tool as ClaudeToolCall
         window.electronAPI.debug.log(`[renderer] onToolUse name=${toolCall.toolName} id=${toolCall.id?.slice(0, 12)} status=${toolCall.status} parentToolUseId=${toolCall.parentToolUseId || 'none'}`)
         // Route subagent tool calls to separate bucket
@@ -771,7 +811,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
 
       api.onToolResult((sid: string, result: unknown) => {
         if (sid !== sessionId) return
-        workspaceStore.updateTerminalActivity(sessionId)
         const { id, ...updates } = result as { id: string; status: string; result?: string; description?: string }
         if ((updates as { description?: string }).description) {
           window.electronAPI.debug.log(`[renderer] onToolResult description update id=${id} desc=${(updates as { description?: string }).description}`)
@@ -808,7 +847,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
         if (sid !== sessionId) return
         setIsStreaming(false)
         setIsInterrupted(false)
-        setStreamingText('')
+        clearStreamingText()
         setStreamingThinking('')
         // Refresh usage after agent activity (usage likely changed)
         workspaceStore.refreshUsageNow()
@@ -868,7 +907,15 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
             })
           }
         } else {
-          if (d.text) setStreamingText(prev => prev + d.text)
+          if (d.text) {
+            streamingTextBufRef.current += d.text
+            if (!streamingTextRafRef.current) {
+              streamingTextRafRef.current = requestAnimationFrame(() => {
+                setStreamingText(streamingTextBufRef.current)
+                streamingTextRafRef.current = null
+              })
+            }
+          }
           if (d.thinking) setStreamingThinking(prev => prev + d.thinking)
         }
       }),
@@ -955,7 +1002,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       api.onSessionReset((sid: string) => {
         if (sid !== sessionId) return
         setMessages([])
-        setStreamingText('')
+        clearStreamingText()
         setStreamingThinking('')
         setPendingPermission(null)
         setPendingQuestion(null)
@@ -1020,7 +1067,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
         loadedFromArchiveRef.current = 0
         setHasMoreArchived(false)
         window.electronAPI.claude.clearArchive(sessionId).catch(() => {})
-        setStreamingText('')
+        clearStreamingText()
         setStreamingThinking('')
 
         // Auto-send pending prompt from fork AFTER history is loaded
@@ -1078,6 +1125,8 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     return () => {
       console.log(`${tag} unsubscribing IPC events`)
       unsubs.forEach(unsub => unsub())
+      if (activityThrottleRef.current) clearTimeout(activityThrottleRef.current)
+      if (streamingTextRafRef.current !== null) cancelAnimationFrame(streamingTextRafRef.current)
     }
   }, [sessionId])
 
@@ -1305,7 +1354,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       archivedCountRef.current = 0
       loadedFromArchiveRef.current = 0
       setHasMoreArchived(false)
-      setStreamingText('')
+      clearStreamingText()
       setStreamingThinking('')
       setIsStreaming(false)
       cacheHistoryRef.current = []
@@ -1325,7 +1374,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     archivedCountRef.current = 0
     loadedFromArchiveRef.current = 0
     setHasMoreArchived(false)
-    setStreamingText('')
+    clearStreamingText()
     setStreamingThinking('')
     setIsStreaming(false)
     setSessionMeta(null)
@@ -1566,7 +1615,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       window.electronAPI.claude.abortSession(sessionId)
       setIsStreaming(false)
       setIsInterrupted(false)
-      setStreamingText('')
+      clearStreamingText()
       setStreamingThinking('')
       setPendingPermission(null)
       setMessages(prev => {
@@ -1595,7 +1644,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       archivedCountRef.current = 0
       loadedFromArchiveRef.current = 0
       setHasMoreArchived(false)
-      setStreamingText('')
+      clearStreamingText()
       setStreamingThinking('')
       cacheHistoryRef.current = []
       lastResultRef.current = null
@@ -1767,7 +1816,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
         }])
         setIsStreaming(true)
         setIsInterrupted(false)
-        setStreamingText('')
+        clearStreamingText()
         setStreamingThinking('')
         await window.electronAPI.claude.sendMessage(sessionId, contextPrompt, undefined, getAutoCompactWindowForModel(currentModel, settingsStore.getSettings().autoCompactWindow))
       } catch {
@@ -1805,7 +1854,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     if (!isStreaming || isInterrupted) {
       setIsStreaming(true)
       setIsInterrupted(false)
-      setStreamingText('')
+      clearStreamingText()
       setStreamingThinking('')
     }
 
@@ -1846,7 +1895,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     if (!isStreaming) return
     window.electronAPI.claude.stopSession(sessionId)
     setIsInterrupted(true)
-    setStreamingText('')
+    clearStreamingText()
     setStreamingThinking('')
     setPendingPermission(null)
     textareaRef.current?.focus()
@@ -1858,7 +1907,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     window.electronAPI.claude.abortSession(sessionId)
     setIsStreaming(false)
     setIsInterrupted(false)
-    setStreamingText('')
+    clearStreamingText()
     setStreamingThinking('')
     setPendingPermission(null)
     setMessages(prev => {
@@ -1998,6 +2047,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     if (e.key === 'ArrowUp' && !e.shiftKey && !e.nativeEvent.isComposing) {
       const history = inputHistoryRef.current
       if (history.length === 0) return
+      const textarea = textareaRef.current
+      if (textarea) {
+        const isOnFirstLine = !textarea.value.substring(0, textarea.selectionStart).includes('\n')
+        if (!isOnFirstLine) return
+      }
       e.preventDefault()
       if (inputHistoryIndexRef.current === -1) {
         inputDraftRef.current = inputValueRef.current
@@ -2010,6 +2064,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     }
     if (e.key === 'ArrowDown' && !e.shiftKey && !e.nativeEvent.isComposing) {
       if (inputHistoryIndexRef.current === -1) return
+      const textarea = textareaRef.current
+      if (textarea) {
+        const isOnLastLine = !textarea.value.substring(textarea.selectionStart).includes('\n')
+        if (!isOnLastLine) return
+      }
       e.preventDefault()
       const history = inputHistoryRef.current
       if (inputHistoryIndexRef.current < history.length - 1) {
@@ -2805,11 +2864,10 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       // Edit tool: show diff view
       if (item.toolName === 'Edit' && item.input.old_string !== undefined) {
         const filePath = String(item.input.file_path || '')
-        const oldStr = String(item.input.old_string || '')
-        const newStr = String(item.input.new_string || '')
         const isDiffExpanded = expandedTools.has(`diff-${item.id}`)
-        const oldLines = oldStr.split('\n')
-        const newLines = newStr.split('\n')
+        const precomputed = editDiffLines.get(item.id)
+        const oldLines = precomputed?.oldLines ?? String(item.input.old_string || '').split('\n')
+        const newLines = precomputed?.newLines ?? String(item.input.new_string || '').split('\n')
         const totalLines = oldLines.length + newLines.length
         const isLongDiff = totalLines > 12
         const resultRaw = item.result ? (typeof item.result === 'string' ? item.result : String(item.result)) : ''
@@ -2872,9 +2930,8 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
       // Write tool: show content preview
       if (item.toolName === 'Write' && item.input.content !== undefined) {
         const filePath = String(item.input.file_path || '')
-        const content = String(item.input.content || '')
         const isContentExpanded = expandedTools.has(`write-${item.id}`)
-        const contentLines = content.split('\n')
+        const contentLines = writeContentLines.get(item.id) ?? String(item.input.content || '').split('\n')
         const isLong = contentLines.length > 8
         const resultRaw = item.result ? (typeof item.result === 'string' ? item.result : String(item.result)) : ''
         const { content: resultText, errors: resultErrors } = splitSystemReminders(resultRaw)
