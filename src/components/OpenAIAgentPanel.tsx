@@ -2021,6 +2021,11 @@ export function OpenAIAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     if (e.key === 'ArrowUp' && !e.shiftKey && !e.nativeEvent.isComposing) {
       const history = inputHistoryRef.current
       if (history.length === 0) return
+      const textarea = textareaRef.current
+      if (textarea) {
+        const isOnFirstLine = !textarea.value.substring(0, textarea.selectionStart).includes('\n')
+        if (!isOnFirstLine) return
+      }
       e.preventDefault()
       if (inputHistoryIndexRef.current === -1) {
         inputDraftRef.current = inputValueRef.current
@@ -2033,6 +2038,11 @@ export function OpenAIAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
     }
     if (e.key === 'ArrowDown' && !e.shiftKey && !e.nativeEvent.isComposing) {
       if (inputHistoryIndexRef.current === -1) return
+      const textarea = textareaRef.current
+      if (textarea) {
+        const isOnLastLine = !textarea.value.substring(textarea.selectionStart).includes('\n')
+        if (!isOnLastLine) return
+      }
       e.preventDefault()
       const history = inputHistoryRef.current
       if (inputHistoryIndexRef.current < history.length - 1) {
