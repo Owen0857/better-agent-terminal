@@ -3364,7 +3364,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId, onClos
           e.preventDefault()
           setContextMenu({ x: e.clientX, y: e.clientY })
         }}
-        onMouseUp={handleMessagesMouseUp}
       >
         {(hasMoreArchived || isLoadingMore) && (
           <div className="claude-load-more">

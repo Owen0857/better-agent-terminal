@@ -1,4 +1,5 @@
 import { AgentPresetId } from './agent-presets';
+import type { QuickAction } from './quick-action'
 
 export type { QuickAction } from './quick-action'
 export { DEFAULT_QUICK_ACTIONS } from './quick-action'
@@ -238,6 +239,7 @@ export interface AppSettings {
   closeTerminalAfterProcessExit: boolean;  // 程序結束後是否自動關閉終端機
   createDefaultAgentTerminal: boolean;  // 是否預設建立 Agent Terminal
   allowBypassPermissions: boolean;  // 允許切換 bypassPermissions 模式不再確認；同時讓 Codex 以 danger-full-access 啟動
+  codexCliDangerousMode?: boolean;  // Codex CLI PTY 啟動時加上 --sandbox danger-full-access
   defaultModel?: string;     // Legacy Claude 預設模型（保留用於遷移）
   defaultClaudeModel?: string;  // Claude 預設模型（空 = 使用 Agent 自己的預設）
   defaultClaudeModelCustom?: boolean;  // Claude 模型欄位是否使用自訂輸入模式

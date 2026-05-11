@@ -418,6 +418,32 @@ function setupCopyShortcutForwarding(win: BrowserWindow) {
   })
 }
 
+// Show native spell-check suggestions on right-click of a misspelled word.
+// Only triggers when a misspelled word is under the cursor, to avoid clashing
+// with custom renderer-side context menus.
+function setupSpellCheckContextMenu(win: BrowserWindow) {
+  win.webContents.on('context-menu', (_event, params) => {
+    if (!params.misspelledWord) return
+    const template: Electron.MenuItemConstructorOptions[] = []
+    if (params.dictionarySuggestions.length > 0) {
+      for (const suggestion of params.dictionarySuggestions) {
+        template.push({
+          label: suggestion,
+          click: () => win.webContents.replaceMisspelling(suggestion)
+        })
+      }
+    } else {
+      template.push({ label: 'No suggestions', enabled: false })
+    }
+    template.push({ type: 'separator' })
+    template.push({
+      label: 'Add to Dictionary',
+      click: () => win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord)
+    })
+    Menu.buildFromTemplate(template).popup({ window: win })
+  })
+}
+
 function createWindow(windowId: string, bounds?: { x: number; y: number; width: number; height: number }) {
   const win = new BrowserWindow({
     width: bounds?.width || 1400,
@@ -440,6 +466,7 @@ function createWindow(windowId: string, bounds?: { x: number; y: number; width: 
   })
 
   setupCopyShortcutForwarding(win)
+  setupSpellCheckContextMenu(win)
   windowMap.set(windowId, win)
 
   if (process.platform === 'darwin') {
@@ -1524,6 +1551,7 @@ function registerLocalHandlers() {
       frame: true, titleBarStyle: 'default', icon: nativeImage.createFromPath(path.join(__dirname, process.platform === 'win32' ? '../assets/icon.ico' : '../assets/icon.png'))
     })
     setupCopyShortcutForwarding(detachedWin)
+    setupSpellCheckContextMenu(detachedWin)
     setupResizeThrottle(detachedWin, 'detached')
     detachedWindows.set(workspaceId, detachedWin)
     const urlParam = `?detached=${encodeURIComponent(workspaceId)}`

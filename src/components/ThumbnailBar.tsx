@@ -375,7 +375,7 @@ export function ThumbnailBar({
                 <div className="thumbnail-add-menu" ref={addMenuPopupRef} style={menuStyle}>
                   <div
                     className="thumbnail-add-menu-item"
-                    onClick={() => { onAddTerminal(); setShowAddMenu(false) }}
+                    onClick={() => { onAddTerminal?.(); setShowAddMenu(false) }}
                   >
                     <span className="thumbnail-add-menu-icon">⌘</span>
                     {t('terminal.terminalLabel')}
