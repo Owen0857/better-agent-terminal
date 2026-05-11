@@ -154,6 +154,8 @@ async function readIndexFile(filePath: string): Promise<ProfileIndex | null> {
     if (e.code === 'ENOENT') return null
     throw new Error(`Failed to read profile index at ${filePath}: ${e.message}`)
   }
+  // Strip UTF-8 BOM if present (Windows tools like PowerShell Out-File can add it)
+  if (data.charCodeAt(0) === 0xFEFF) data = data.slice(1)
   return hydrateRemoteTokens(normalizeIndex(JSON.parse(data)))
 }
 
@@ -179,13 +181,15 @@ async function readIndex(): Promise<ProfileIndex | null> {
     } catch (bakErr) {
       logger.error(`[profile] backup index also unreadable:`, bakErr instanceof Error ? bakErr.message : String(bakErr))
     }
-    // Preserve the corrupt file so user can recover manually — never silently overwrite.
+    // Quarantine the corrupt file so user can recover manually, then return null
+    // so ensureInitialized() can create a fresh default — both files are unreadable anyway.
     const quarantine = `${indexPath}.corrupt.${Date.now()}`
     try {
       await fs.copyFile(indexPath, quarantine)
       logger.error(`[profile] quarantined corrupt index at ${quarantine}`)
     } catch { /* best effort */ }
-    throw err
+    logger.error(`[profile] both index and backup are corrupt; starting fresh`)
+    return null
   }
 }
 
@@ -202,9 +206,17 @@ async function writeIndex(index: ProfileIndex): Promise<void> {
     await fs.copyFile(indexPath, bakPath)
   } catch { /* no existing file, or unreadable — skip backup */ }
 
-  // Atomic write: write to temp, then rename. Crash mid-write leaves old file intact.
+  // Atomic write: write to temp, fsync, then rename. Crash mid-write leaves old file intact.
+  // fsync before rename ensures the data is on disk — without it, NTFS can rename the tmp
+  // pointer before flushing the file contents, leaving a zero-byte file after a power loss.
   const sanitized = stripAndPersistRemoteTokens(index)
-  await fs.writeFile(tmpPath, JSON.stringify(sanitized, null, 2), 'utf-8')
+  const fh = await fs.open(tmpPath, 'w')
+  try {
+    await fh.writeFile(JSON.stringify(sanitized, null, 2), 'utf-8')
+    await fh.sync()
+  } finally {
+    await fh.close()
+  }
   await fs.rename(tmpPath, indexPath)
 }
 
