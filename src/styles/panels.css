@@ -605,3 +605,83 @@
   opacity: 0.7;
   font-family: monospace;
 }
+
+/* ===== Session Tabs ===== */
+
+/* Override bar to be compact (tab-only, no preview) */
+.thumbnail-bar {
+  min-height: 52px;
+}
+
+.session-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  height: 36px;
+  flex-shrink: 0;
+  max-width: 220px;
+  min-width: 140px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  overflow: hidden;
+  transition: background 0.15s ease, border-color 0.15s ease;
+  user-select: none;
+}
+
+.session-tab:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.session-tab.active {
+  background: var(--bg-primary, var(--bg-secondary));
+  border-color: var(--accent-color);
+  border-bottom-color: var(--accent-color);
+}
+
+.session-tab.agent-terminal {
+  border-color: var(--agent-color, var(--claude-accent));
+}
+
+.session-tab.agent-terminal.active {
+  border-bottom-color: var(--agent-color, var(--claude-accent));
+}
+
+.session-tab-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.session-tab-name {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+
+.session-tab.active .session-tab-name {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.session-tab-edit-input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 6px;
+  font-size: 13px;
+  font-family: inherit;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--accent-color);
+  border-radius: 3px;
+  color: var(--text-primary);
+  outline: none;
+}

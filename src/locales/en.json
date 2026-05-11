@@ -293,6 +293,8 @@
     "showPromptBox": "Show prompt box",
     "restartTerminal": "Restart terminal",
     "closeTerminal": "Close terminal",
+    "renameTerminal": "Rename",
+    "editDescription": "Edit Description",
     "terminals": "Terminals",
     "workspaceSessions": "Sessions",
     "addTerminalOrAgent": "Add Terminal or Agent",

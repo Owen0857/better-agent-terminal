@@ -314,6 +314,17 @@ class WorkspaceStore {
     this.save()
   }
 
+  setTerminalDescription(id: string, description: string): void {
+    this.state = {
+      ...this.state,
+      terminals: this.state.terminals.map(t =>
+        t.id === id ? { ...t, description: description.trim() || undefined } : t
+      )
+    }
+    this.notify()
+    this.save()
+  }
+
   setTerminalGeneratedTitle(id: string, title: string): void {
     this.state = {
       ...this.state,
@@ -599,6 +610,7 @@ class WorkspaceStore {
         agentPreset: t.agentPreset,
         title: t.title,
         alias: t.alias,
+        description: t.description,
         cwd: t.cwd,
         sdkSessionId: t.sdkSessionId,
         model: t.model,
@@ -658,6 +670,7 @@ class WorkspaceStore {
           agentPreset: t.agentPreset,
           title: presetTitle,
           alias: t.alias,
+          description: t.description,
           cwd,
           sdkSessionId: t.sdkSessionId,
           model: t.model,

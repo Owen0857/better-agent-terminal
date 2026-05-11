@@ -2,10 +2,11 @@ import { useState, useRef, useEffect, useCallback, useLayoutEffect } from 'react
 import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import type { TerminalInstance, QuickAction } from '../types'
-import { TerminalThumbnail } from './TerminalThumbnail'
+import { SessionTab } from './SessionTab'
 import type { AgentPreset } from '../types/agent-presets'
 import { getAgentPreset } from '../types/agent-presets'
 import { QuickActionContextMenu } from './QuickActionContextMenu'
+import { workspaceStore } from '../stores/workspace-store'
 
 interface ThumbnailBarProps {
   terminals: TerminalInstance[]
@@ -66,6 +67,7 @@ export function ThumbnailBar({
   const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({})
   const [thumbMenu, setThumbMenu] = useState<{ x: number; y: number; terminalId: string } | null>(null)
   const [thumbMenuPos, setThumbMenuPos] = useState<{ x: number; y: number } | null>(null)
+  const [editTarget, setEditTarget] = useState<{ id: string; mode: 'rename' | 'description' } | null>(null)
   const addMenuRef = useRef<HTMLDivElement>(null)
   const addMenuPopupRef = useRef<HTMLDivElement>(null)
   const addBtnRef = useRef<HTMLButtonElement>(null)
@@ -105,6 +107,31 @@ export function ThumbnailBar({
     if (y + rect.height > vh) y = Math.max(4, vh - rect.height - 4)
     setContextMenuPos({ x, y })
   }, [contextMenu])
+
+  useLayoutEffect(() => {
+    if (!thumbMenu || !thumbMenuRef.current) {
+      setThumbMenuPos(null)
+      return
+    }
+    const rect = thumbMenuRef.current.getBoundingClientRect()
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    let { x, y } = thumbMenu
+    if (x + rect.width > vw) x = Math.max(4, vw - rect.width - 4)
+    if (y + rect.height > vh) y = Math.max(4, vh - rect.height - 4)
+    setThumbMenuPos({ x, y })
+  }, [thumbMenu])
+
+  useEffect(() => {
+    if (!thumbMenu) return
+    const handleClickOutside = (e: MouseEvent) => {
+      if (thumbMenuRef.current && !thumbMenuRef.current.contains(e.target as Node)) {
+        setThumbMenu(null)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [thumbMenu])
 
   useEffect(() => {
     const clearMiddlePan = () => {
@@ -467,15 +494,19 @@ export function ThumbnailBar({
             }${draggedId === terminal.id ? ' dragging' : ''}`}
             onContextMenu={(e) => handleThumbnailContextMenu(e, terminal.id)}
           >
-            <TerminalThumbnail
+            <SessionTab
               terminal={terminal}
               isActive={terminal.id === focusedTerminalId}
               onClick={() => onFocus(terminal.id)}
+              onRename={(id, alias) => workspaceStore.renameTerminal(id, alias)}
+              onEditDescription={(id, desc) => workspaceStore.setTerminalDescription(id, desc)}
+              editMode={editTarget?.id === terminal.id ? editTarget.mode : null}
+              onEditModeEnd={() => setEditTarget(null)}
             />
           </div>
         ))}
       </div>
-      {thumbMenu && onCloseTerminal && createPortal(
+      {thumbMenu && createPortal(
         <div
           ref={thumbMenuRef}
           className="workspace-context-menu"
@@ -485,14 +516,37 @@ export function ThumbnailBar({
           }
         >
           <div
-            className="context-menu-item danger"
+            className="context-menu-item"
             onClick={() => {
-              onCloseTerminal(thumbMenu.terminalId)
+              setEditTarget({ id: thumbMenu.terminalId, mode: 'rename' })
               setThumbMenu(null)
             }}
           >
-            {t('terminal.closeTerminal')}
+            {t('terminal.renameTerminal')}
           </div>
+          <div
+            className="context-menu-item"
+            onClick={() => {
+              setEditTarget({ id: thumbMenu.terminalId, mode: 'description' })
+              setThumbMenu(null)
+            }}
+          >
+            {t('terminal.editDescription')}
+          </div>
+          {onCloseTerminal && (
+            <>
+              <div className="context-menu-separator" />
+              <div
+                className="context-menu-item danger"
+                onClick={() => {
+                  onCloseTerminal(thumbMenu.terminalId)
+                  setThumbMenu(null)
+                }}
+              >
+                {t('terminal.closeTerminal')}
+              </div>
+            </>
+          )}
         </div>,
         document.body
       )}

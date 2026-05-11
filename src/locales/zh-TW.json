@@ -293,6 +293,8 @@
     "showPromptBox": "顯示提示輸入框",
     "restartTerminal": "重新啟動終端",
     "closeTerminal": "關閉終端",
+    "renameTerminal": "重新命名",
+    "editDescription": "編輯提示說明",
     "terminals": "終端",
     "workspaceSessions": "工作階段",
     "addTerminalOrAgent": "新增終端或 Agent",

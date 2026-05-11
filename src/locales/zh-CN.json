@@ -277,6 +277,8 @@
     "showPromptBox": "显示提示输入框",
     "restartTerminal": "重新启动终端",
     "closeTerminal": "关闭终端",
+    "renameTerminal": "重命名",
+    "editDescription": "编辑提示说明",
     "terminals": "终端",
     "workspaceSessions": "会话",
     "addTerminalOrAgent": "新增终端或 Agent",

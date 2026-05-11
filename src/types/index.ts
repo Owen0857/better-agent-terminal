@@ -53,6 +53,7 @@ export interface TerminalInstance {
   agentPreset?: AgentPresetId;   // 可選的 Agent 預設
   title: string;                 // 系統/官方名稱
   alias?: string;                // 使用者手動命名，UI 顯示優先使用
+  description?: string;          // 使用者自訂提示說明，顯示於 hover tooltip
   pid?: number;
   cwd: string;
   scrollbackBuffer: string[];

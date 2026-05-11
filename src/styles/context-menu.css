@@ -64,3 +64,9 @@
   background: var(--border-color);
   margin: 4px 0;
 }
+
+.context-menu-separator {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 0;
+}
