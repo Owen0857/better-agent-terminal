@@ -614,6 +614,7 @@
 }
 
 .session-tab {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -628,19 +629,42 @@
   border-bottom: 2px solid transparent;
   cursor: pointer;
   overflow: hidden;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  opacity: 0.7;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease, box-shadow 0.15s ease;
   user-select: none;
 }
 
 .session-tab:hover {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.2);
+  opacity: 0.9;
 }
 
 .session-tab.active {
-  background: var(--bg-primary, var(--bg-secondary));
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--accent-color) 22%, var(--bg-primary, var(--bg-secondary))),
+    var(--bg-primary, var(--bg-secondary))
+  );
   border-color: var(--accent-color);
   border-bottom-color: var(--accent-color);
+  opacity: 1;
+  box-shadow:
+    0 -2px 0 0 var(--accent-color) inset,
+    0 0 0 1px var(--accent-color),
+    0 0 12px color-mix(in srgb, var(--accent-color) 45%, transparent);
+  z-index: 1;
+}
+
+.session-tab.active::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--accent-color);
+  box-shadow: 0 0 8px var(--accent-color);
 }
 
 .session-tab.agent-terminal {
@@ -648,7 +672,22 @@
 }
 
 .session-tab.agent-terminal.active {
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--agent-color, var(--claude-accent)) 25%, var(--bg-primary, var(--bg-secondary))),
+    var(--bg-primary, var(--bg-secondary))
+  );
+  border-color: var(--agent-color, var(--claude-accent));
   border-bottom-color: var(--agent-color, var(--claude-accent));
+  box-shadow:
+    0 -2px 0 0 var(--agent-color, var(--claude-accent)) inset,
+    0 0 0 1px var(--agent-color, var(--claude-accent)),
+    0 0 12px color-mix(in srgb, var(--agent-color, var(--claude-accent)) 50%, transparent);
+}
+
+.session-tab.agent-terminal.active::before {
+  background: var(--agent-color, var(--claude-accent));
+  box-shadow: 0 0 8px var(--agent-color, var(--claude-accent));
 }
 
 .session-tab-icon {
@@ -669,7 +708,8 @@
 
 .session-tab.active .session-tab-name {
   color: var(--text-primary);
-  font-weight: 500;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 }
 
 .session-tab-edit-input {
